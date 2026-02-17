@@ -23,7 +23,8 @@ It now also includes an initial C/CMake scaffold:
 - `packrat::packrat` static library target
 - `packrat` CLI executable
 - Manifest parser + schema validator for the v0 image/sprite/animation schema
-- Package build path that writes a `.prpk` skeleton file
+- Image import plumbing for atlas preparation (currently PNG metadata import)
+- Package build path that writes `.prpk` with `STRS` + `INDX` chunks
 
 ## Documents
 
@@ -49,5 +50,5 @@ cmake --build build
 Current implementation status:
 
 - `validate`: parses manifest sections and validates schema/references for v0
-- `build`: validates manifest and writes `.prpk` header/chunk-table skeleton (+ optional debug JSON)
+- `build`: validates, imports image metadata, and writes `.prpk` with `STRS`/`INDX` chunks (+ optional debug JSON)
 - `inspect`: command scaffolded, not implemented yet
