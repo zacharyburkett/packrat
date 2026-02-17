@@ -63,6 +63,8 @@ Compiled package data should minimally expose:
 
 Authoring file: `packrat.toml`
 
+Normative schema reference: `docs/manifest_schema.md`
+
 ```toml
 schema_version = 1
 package_name = "sample_game_assets"
@@ -147,6 +149,8 @@ The runtime-facing API should be read-only and allocation-conscious:
 4. Access frame data (atlas page, UVs, duration).
 5. Close/release package.
 
+Contract reference: `docs/api.md`
+
 This keeps gameplay code data-driven:
 
 - Animation timing and frame ordering live in package data.
@@ -183,4 +187,3 @@ Every build diagnostic should include:
 4. Clear remediation text
 
 Build exits non-zero when any `error` is emitted.
-

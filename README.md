@@ -16,9 +16,11 @@ Longer-term direction:
 
 ## Current Status
 
-This repository currently contains initial planning and architecture documents.
+This repository currently contains initial planning and interface/format documentation.
 
 ## Documents
 
 - `docs/proposal.md`
 - `docs/architecture.md`
+- `docs/manifest_schema.md`
+- `docs/api.md`
