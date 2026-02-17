@@ -258,20 +258,44 @@ static void pr_cli_print_inspect_text(
     int verbose
 )
 {
+    unsigned int page_count;
     unsigned int sprite_count;
     unsigned int animation_count;
     unsigned int i;
 
+    page_count = pr_package_atlas_page_count(package);
     sprite_count = pr_package_sprite_count(package);
     animation_count = pr_package_animation_count(package);
 
     fprintf(stdout, "Package: %s\n", package_path);
-    fprintf(stdout, "Atlas pages: %u\n", pr_package_atlas_page_count(package));
+    fprintf(stdout, "Atlas pages: %u\n", page_count);
     fprintf(stdout, "Sprites: %u\n", sprite_count);
     fprintf(stdout, "Animations: %u\n", animation_count);
 
     if (verbose == 0) {
         return;
+    }
+
+    fprintf(stdout, "\nAtlas:\n");
+    for (i = 0u; i < page_count; ++i) {
+        unsigned int width;
+        unsigned int height;
+        unsigned int stride;
+        const unsigned char *pixels;
+
+        width = 0u;
+        height = 0u;
+        stride = 0u;
+        pixels = pr_package_atlas_page_pixels(package, i, &width, &height, &stride);
+        fprintf(
+            stdout,
+            "  [%u] %ux%u stride=%u pixels=%s\n",
+            i,
+            width,
+            height,
+            stride,
+            (pixels != NULL) ? "yes" : "no"
+        );
     }
 
     fprintf(stdout, "\nSprites:\n");
@@ -356,10 +380,12 @@ static void pr_cli_print_inspect_json(
     int verbose
 )
 {
+    unsigned int page_count;
     unsigned int sprite_count;
     unsigned int animation_count;
     unsigned int i;
 
+    page_count = pr_package_atlas_page_count(package);
     sprite_count = pr_package_sprite_count(package);
     animation_count = pr_package_animation_count(package);
 
@@ -368,7 +394,7 @@ static void pr_cli_print_inspect_json(
     (void)fprintf(
         stdout,
         "\",\"atlas_pages\":%u,\"sprite_count\":%u,\"animation_count\":%u",
-        pr_package_atlas_page_count(package),
+        page_count,
         sprite_count,
         animation_count
     );
@@ -377,6 +403,32 @@ static void pr_cli_print_inspect_json(
         (void)fputs("}\n", stdout);
         return;
     }
+
+    (void)fputs(",\"atlas\":[", stdout);
+    for (i = 0u; i < page_count; ++i) {
+        unsigned int width;
+        unsigned int height;
+        unsigned int stride;
+        const unsigned char *pixels;
+
+        if (i > 0u) {
+            (void)fputc(',', stdout);
+        }
+        width = 0u;
+        height = 0u;
+        stride = 0u;
+        pixels = pr_package_atlas_page_pixels(package, i, &width, &height, &stride);
+        (void)fprintf(
+            stdout,
+            "{\"index\":%u,\"width\":%u,\"height\":%u,\"stride\":%u,\"has_pixels\":%s}",
+            i,
+            width,
+            height,
+            stride,
+            (pixels != NULL) ? "true" : "false"
+        );
+    }
+    (void)fputs("]", stdout);
 
     (void)fputs(",\"sprites\":[", stdout);
     for (i = 0u; i < sprite_count; ++i) {

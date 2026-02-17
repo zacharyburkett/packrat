@@ -1,11 +1,15 @@
 #include "packrat/build.h"
 
 #include <errno.h>
+#include <limits.h>
+#include <setjmp.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+
+#include <png.h>
 
 #ifdef _WIN32
 #include <direct.h>
@@ -55,6 +59,9 @@ typedef struct pr_imported_image {
     uint32_t height;
     uint64_t source_bytes;
     uint32_t format;
+    uint32_t row_bytes;
+    size_t pixel_bytes;
+    unsigned char *pixels;
 } pr_imported_image_t;
 
 typedef struct pr_index_maps {
@@ -420,60 +427,197 @@ static unsigned char *pr_read_binary_file(const char *path, size_t *out_size)
     return buffer;
 }
 
-static uint32_t pr_read_u32_be(const unsigned char *bytes)
+static int pr_mul_size(size_t a, size_t b, size_t *out)
 {
-    if (bytes == NULL) {
-        return 0u;
+    if (out == NULL) {
+        return 0;
     }
-    return (
-        ((uint32_t)bytes[0] << 24u) |
-        ((uint32_t)bytes[1] << 16u) |
-        ((uint32_t)bytes[2] << 8u) |
-        ((uint32_t)bytes[3])
-    );
+    if (a != 0u && b > (SIZE_MAX / a)) {
+        return 0;
+    }
+    *out = a * b;
+    return 1;
 }
 
-static int pr_parse_png_dimensions(
-    const unsigned char *bytes,
-    size_t size,
+static int pr_decode_png_rgba_file(
+    const char *path,
     uint32_t *out_width,
-    uint32_t *out_height
+    uint32_t *out_height,
+    uint32_t *out_row_bytes,
+    unsigned char **out_pixels,
+    size_t *out_pixel_bytes
 )
 {
-    static const unsigned char PNG_SIGNATURE[8] = {
-        0x89u, 0x50u, 0x4Eu, 0x47u, 0x0Du, 0x0Au, 0x1Au, 0x0Au
-    };
-    uint32_t ihdr_len;
+    FILE *file;
+    png_structp png_ptr;
+    png_infop info_ptr;
+    png_infop end_info_ptr;
+    png_uint_32 width;
+    png_uint_32 height;
+    int bit_depth;
+    int color_type;
+    int interlace_type;
+    png_size_t row_bytes;
+    png_bytep *rows = NULL;
+    size_t rows_bytes;
+    size_t pixel_bytes;
+    unsigned char *pixels = NULL;
+    uint32_t y;
+    unsigned char signature[8];
 
     if (
-        bytes == NULL ||
-        size < 33u ||
+        path == NULL ||
         out_width == NULL ||
-        out_height == NULL
+        out_height == NULL ||
+        out_row_bytes == NULL ||
+        out_pixels == NULL ||
+        out_pixel_bytes == NULL
     ) {
         return 0;
     }
 
-    if (memcmp(bytes, PNG_SIGNATURE, sizeof(PNG_SIGNATURE)) != 0) {
+    *out_pixels = NULL;
+    *out_pixel_bytes = 0u;
+    *out_width = 0u;
+    *out_height = 0u;
+    *out_row_bytes = 0u;
+
+    file = fopen(path, "rb");
+    if (file == NULL) {
         return 0;
     }
-    if (memcmp(bytes + 12u, "IHDR", 4u) != 0) {
+    if (fread(signature, 1u, sizeof(signature), file) != sizeof(signature)) {
+        (void)fclose(file);
+        return 0;
+    }
+    if (png_sig_cmp((png_const_bytep)signature, 0, sizeof(signature)) != 0) {
+        (void)fclose(file);
         return 0;
     }
 
-    ihdr_len = pr_read_u32_be(bytes + 8u);
-    if (ihdr_len < 13u) {
+    png_ptr = png_create_read_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+    if (png_ptr == NULL) {
+        return 0;
+    }
+    info_ptr = png_create_info_struct(png_ptr);
+    end_info_ptr = png_create_info_struct(png_ptr);
+    if (info_ptr == NULL || end_info_ptr == NULL) {
+        png_destroy_read_struct(&png_ptr, &info_ptr, &end_info_ptr);
         return 0;
     }
 
-    *out_width = pr_read_u32_be(bytes + 16u);
-    *out_height = pr_read_u32_be(bytes + 20u);
-    return (*out_width > 0u && *out_height > 0u) ? 1 : 0;
+    if (setjmp(png_jmpbuf(png_ptr))) {
+        free(rows);
+        free(pixels);
+        png_destroy_read_struct(&png_ptr, &info_ptr, &end_info_ptr);
+        (void)fclose(file);
+        return 0;
+    }
+
+    png_init_io(png_ptr, file);
+    png_set_sig_bytes(png_ptr, (int)sizeof(signature));
+
+    png_read_info(png_ptr, info_ptr);
+    width = png_get_image_width(png_ptr, info_ptr);
+    height = png_get_image_height(png_ptr, info_ptr);
+    bit_depth = png_get_bit_depth(png_ptr, info_ptr);
+    color_type = png_get_color_type(png_ptr, info_ptr);
+    interlace_type = png_get_interlace_type(png_ptr, info_ptr);
+
+    if (width == 0u || height == 0u || width > UINT32_MAX || height > UINT32_MAX) {
+        free(pixels);
+        png_destroy_read_struct(&png_ptr, &info_ptr, &end_info_ptr);
+        return 0;
+    }
+
+    if (bit_depth == 16) {
+        png_set_strip_16(png_ptr);
+    }
+    if (color_type == PNG_COLOR_TYPE_PALETTE) {
+        png_set_palette_to_rgb(png_ptr);
+    }
+    if (color_type == PNG_COLOR_TYPE_GRAY && bit_depth < 8) {
+#if PNG_LIBPNG_VER >= 10209
+        png_set_expand_gray_1_2_4_to_8(png_ptr);
+#else
+        png_set_gray_1_2_4_to_8(png_ptr);
+#endif
+    }
+    if (png_get_valid(png_ptr, info_ptr, PNG_INFO_tRNS) != 0) {
+        png_set_tRNS_to_alpha(png_ptr);
+    }
+    if (color_type == PNG_COLOR_TYPE_GRAY || color_type == PNG_COLOR_TYPE_GRAY_ALPHA) {
+        png_set_gray_to_rgb(png_ptr);
+    }
+    if ((color_type & PNG_COLOR_MASK_ALPHA) == 0) {
+        png_set_filler(png_ptr, 0xFFu, PNG_FILLER_AFTER);
+    }
+
+    if (interlace_type != PNG_INTERLACE_NONE) {
+        (void)png_set_interlace_handling(png_ptr);
+    }
+    png_read_update_info(png_ptr, info_ptr);
+
+    row_bytes = png_get_rowbytes(png_ptr, info_ptr);
+    if (row_bytes == 0u || row_bytes > UINT32_MAX) {
+        free(pixels);
+        png_destroy_read_struct(&png_ptr, &info_ptr, &end_info_ptr);
+        return 0;
+    }
+    if (!pr_mul_size((size_t)row_bytes, (size_t)height, &pixel_bytes)) {
+        free(pixels);
+        png_destroy_read_struct(&png_ptr, &info_ptr, &end_info_ptr);
+        return 0;
+    }
+
+    pixels = (unsigned char *)malloc(pixel_bytes);
+    if (pixels == NULL) {
+        png_destroy_read_struct(&png_ptr, &info_ptr, &end_info_ptr);
+        return 0;
+    }
+
+    if (!pr_mul_size((size_t)height, sizeof(rows[0]), &rows_bytes)) {
+        free(pixels);
+        png_destroy_read_struct(&png_ptr, &info_ptr, &end_info_ptr);
+        return 0;
+    }
+    rows = (png_bytep *)malloc(rows_bytes);
+    if (rows == NULL) {
+        free(pixels);
+        png_destroy_read_struct(&png_ptr, &info_ptr, &end_info_ptr);
+        return 0;
+    }
+    for (y = 0u; y < (uint32_t)height; ++y) {
+        rows[y] = pixels + (size_t)y * (size_t)row_bytes;
+    }
+
+    png_read_image(png_ptr, rows);
+    png_read_end(png_ptr, end_info_ptr);
+
+    free(rows);
+    (void)fclose(file);
+    png_destroy_read_struct(&png_ptr, &info_ptr, &end_info_ptr);
+
+    *out_width = (uint32_t)width;
+    *out_height = (uint32_t)height;
+    *out_row_bytes = (uint32_t)row_bytes;
+    *out_pixels = pixels;
+    *out_pixel_bytes = pixel_bytes;
+    return 1;
 }
 
 static void pr_imported_images_free(pr_imported_image_t *images, size_t count)
 {
-    (void)count;
+    size_t i;
+
+    if (images == NULL) {
+        return;
+    }
+    for (i = 0u; i < count; ++i) {
+        free(images[i].pixels);
+        images[i].pixels = NULL;
+        images[i].pixel_bytes = 0u;
+    }
     free(images);
 }
 
@@ -563,11 +707,16 @@ static pr_status_t pr_import_manifest_images(
             continue;
         }
 
-        if (!pr_parse_png_dimensions(
-                bytes,
-                byte_size,
+        free(bytes);
+        bytes = NULL;
+
+        if (!pr_decode_png_rgba_file(
+                images[i].resolved_path,
                 &images[i].width,
-                &images[i].height
+                &images[i].height,
+                &images[i].row_bytes,
+                &images[i].pixels,
+                &images[i].pixel_bytes
             )) {
             pr_emit_diag(
                 diag_sink,
@@ -578,13 +727,11 @@ static pr_status_t pr_import_manifest_images(
                 "build.images.format_unsupported",
                 image->id
             );
-            free(bytes);
             continue;
         }
 
         images[i].format = PR_IMAGE_FORMAT_PNG;
         images[i].source_bytes = (uint64_t)byte_size;
-        free(bytes);
     }
 
     for (i = 0u; i < manifest->image_count; ++i) {
@@ -1822,18 +1969,131 @@ static int pr_build_chunk_txtr(
     const pr_manifest_t *manifest,
     const pr_pack_page_t *pages,
     size_t page_count,
+    const pr_imported_image_t *images,
+    const pr_resolved_sprite_t *sprites,
+    size_t sprite_count,
+    const pr_resolved_frame_t *frames,
+    size_t frame_count,
     pr_chunk_payload_t *chunk
 )
 {
     pr_byte_buffer_t buffer;
+    unsigned char **page_pixels;
+    size_t *page_pixel_bytes;
     size_t i;
+    size_t j;
 
     if (
         manifest == NULL ||
         (page_count > 0u && pages == NULL) ||
+        (manifest->image_count > 0u && images == NULL) ||
+        sprite_count != manifest->sprite_count ||
+        (sprite_count > 0u && sprites == NULL) ||
+        (frame_count > 0u && frames == NULL) ||
         chunk == NULL
     ) {
         return 0;
+    }
+
+    page_pixels = NULL;
+    page_pixel_bytes = NULL;
+    if (page_count > 0u) {
+        page_pixels = (unsigned char **)calloc(page_count, sizeof(page_pixels[0]));
+        page_pixel_bytes = (size_t *)calloc(page_count, sizeof(page_pixel_bytes[0]));
+        if (page_pixels == NULL || page_pixel_bytes == NULL) {
+            free(page_pixels);
+            free(page_pixel_bytes);
+            return 0;
+        }
+    }
+
+    for (i = 0u; i < page_count; ++i) {
+        size_t pixel_count;
+        size_t pixel_bytes;
+
+        if (pages[i].final_w == 0u || pages[i].final_h == 0u) {
+            goto fail;
+        }
+        if (
+            !pr_mul_size((size_t)pages[i].final_w, (size_t)pages[i].final_h, &pixel_count) ||
+            !pr_mul_size(pixel_count, 4u, &pixel_bytes)
+        ) {
+            goto fail;
+        }
+        if (pixel_bytes > 0xFFFFFFFFu) {
+            goto fail;
+        }
+
+        page_pixels[i] = (unsigned char *)calloc(1u, pixel_bytes);
+        if (page_pixels[i] == NULL) {
+            goto fail;
+        }
+        page_pixel_bytes[i] = pixel_bytes;
+    }
+
+    for (i = 0u; i < frame_count; ++i) {
+        uint32_t page_index;
+        uint32_t sprite_index;
+        uint32_t image_index;
+        const pr_imported_image_t *source_image;
+        unsigned char *page_buffer;
+        size_t page_stride;
+        size_t src_row_bytes;
+        uint32_t row;
+
+        page_index = frames[i].atlas_page;
+        sprite_index = frames[i].sprite_index;
+
+        if (page_index >= page_count || sprite_index >= sprite_count) {
+            goto fail;
+        }
+
+        image_index = sprites[sprite_index].source_image_index;
+        if (image_index >= manifest->image_count) {
+            goto fail;
+        }
+        source_image = &images[image_index];
+        if (source_image->pixels == NULL) {
+            goto fail;
+        }
+
+        if (
+            frames[i].source_x + frames[i].source_w > source_image->width ||
+            frames[i].source_y + frames[i].source_h > source_image->height ||
+            frames[i].atlas_x + frames[i].atlas_w > pages[page_index].final_w ||
+            frames[i].atlas_y + frames[i].atlas_h > pages[page_index].final_h ||
+            frames[i].atlas_w != frames[i].source_w ||
+            frames[i].atlas_h != frames[i].source_h
+        ) {
+            goto fail;
+        }
+
+        page_buffer = page_pixels[page_index];
+        page_stride = (size_t)pages[page_index].final_w * 4u;
+        src_row_bytes = (size_t)frames[i].source_w * 4u;
+
+        for (row = 0u; row < frames[i].source_h; ++row) {
+            const unsigned char *src_row;
+            unsigned char *dst_row;
+            size_t src_offset;
+            size_t dst_offset;
+
+            src_offset = (size_t)(frames[i].source_y + row) * (size_t)source_image->row_bytes +
+                (size_t)frames[i].source_x * 4u;
+            dst_offset = (size_t)(frames[i].atlas_y + row) * page_stride +
+                (size_t)frames[i].atlas_x * 4u;
+
+            if (
+                src_offset + src_row_bytes > source_image->pixel_bytes ||
+                dst_offset + src_row_bytes > page_pixel_bytes[page_index]
+            ) {
+                goto fail;
+            }
+
+            src_row = source_image->pixels + src_offset;
+            dst_row = page_buffer + dst_offset;
+            memcpy(dst_row, src_row, src_row_bytes);
+        }
     }
 
     pr_byte_buffer_init(&buffer);
@@ -1855,17 +2115,32 @@ static int pr_build_chunk_txtr(
             !pr_byte_buffer_append_u32_le(&buffer, (uint32_t)i) ||
             !pr_byte_buffer_append_u32_le(&buffer, pages[i].final_w) ||
             !pr_byte_buffer_append_u32_le(&buffer, pages[i].final_h) ||
-            !pr_byte_buffer_append_u32_le(&buffer, 0u)
+            !pr_byte_buffer_append_u32_le(&buffer, (uint32_t)page_pixel_bytes[i]) ||
+            !pr_byte_buffer_append(&buffer, page_pixels[i], page_pixel_bytes[i])
         ) {
             pr_byte_buffer_free(&buffer);
-            return 0;
+            goto fail;
         }
     }
 
     memcpy(chunk->id, PR_CHUNK_FORMAT_TXTR, 4u);
     chunk->bytes = buffer.data;
     chunk->size = buffer.size;
+
+    for (j = 0u; j < page_count; ++j) {
+        free(page_pixels[j]);
+    }
+    free(page_pixels);
+    free(page_pixel_bytes);
     return 1;
+
+fail:
+    for (j = 0u; j < page_count; ++j) {
+        free(page_pixels[j]);
+    }
+    free(page_pixels);
+    free(page_pixel_bytes);
+    return 0;
 }
 
 static int pr_build_chunk_sprt(
@@ -2656,7 +2931,17 @@ pr_status_t pr_build_package(
 
     if (
         !pr_build_chunk_strs(&strings, &chunks[0]) ||
-        !pr_build_chunk_txtr(&manifest, atlas_pages, atlas_page_count, &chunks[1]) ||
+        !pr_build_chunk_txtr(
+            &manifest,
+            atlas_pages,
+            atlas_page_count,
+            images,
+            resolved_sprites,
+            resolved_sprite_count,
+            resolved_frames,
+            resolved_frame_count,
+            &chunks[1]
+        ) ||
         !pr_build_chunk_sprt(
             resolved_sprites,
             resolved_sprite_count,

@@ -231,6 +231,13 @@ const pr_animation_t *pr_package_find_animation(
 );
 
 unsigned int pr_package_atlas_page_count(const pr_package_t *package);
+const unsigned char *pr_package_atlas_page_pixels(
+    const pr_package_t *package,
+    unsigned int index,
+    unsigned int *out_width,
+    unsigned int *out_height,
+    unsigned int *out_stride
+);
 
 unsigned int pr_package_sprite_count(const pr_package_t *package);
 const pr_sprite_t *pr_package_sprite_at(

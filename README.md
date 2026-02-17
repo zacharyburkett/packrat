@@ -36,6 +36,8 @@ It now also includes an initial C/CMake scaffold:
 
 ## Build
 
+Requires `libpng` development headers/libraries.
+
 ```sh
 cmake -S . -B build
 cmake --build build
@@ -52,4 +54,5 @@ Current implementation status:
 
 - `validate`: parses manifest sections and validates schema/references for v0
 - `build`: validates, imports image metadata, resolves sprite frames, packs atlas pages, and writes `.prpk` with `STRS`/`TXTR`/`SPRT`/`ANIM`/`INDX` chunks (+ optional debug JSON)
+  - `TXTR` currently stores uncompressed RGBA8 atlas page blobs produced via `libpng` decode + frame blits
 - `inspect`: reads `.prpk` metadata and prints package summaries (`--json`, `--verbose`)

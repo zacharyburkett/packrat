@@ -33,6 +33,14 @@ typedef struct pr_animation_meta {
     uint32_t key_count;
 } pr_animation_meta_t;
 
+typedef struct pr_atlas_page_view {
+    uint32_t width;
+    uint32_t height;
+    uint32_t stride;
+    const unsigned char *pixels;
+    uint32_t pixel_bytes;
+} pr_atlas_page_view_t;
+
 struct pr_package {
     unsigned char *owned_bytes;
     const unsigned char *bytes;
@@ -42,6 +50,8 @@ struct pr_package {
     unsigned int string_count;
 
     unsigned int atlas_page_count;
+    pr_atlas_page_view_t *atlas_pages;
+    int has_txtr_chunk;
 
     pr_sprite_t *sprites;
     unsigned int sprite_count;
@@ -262,6 +272,10 @@ static void pr_package_clear_parsed_data(pr_package_t *package)
     package->strings = NULL;
     package->string_count = 0u;
 
+    free(package->atlas_pages);
+    package->atlas_pages = NULL;
+    package->has_txtr_chunk = 0;
+
     free(package->sprites);
     package->sprites = NULL;
     package->sprite_count = 0u;
@@ -364,6 +378,8 @@ static pr_status_t pr_parse_chunk_txtr(
 {
     uint32_t version;
     uint32_t page_count;
+    pr_atlas_page_view_t *pages;
+    unsigned char *seen_pages;
     size_t cursor;
     uint32_t i;
 
@@ -381,8 +397,22 @@ static pr_status_t pr_parse_chunk_txtr(
         return PR_STATUS_PARSE_ERROR;
     }
 
+    pages = NULL;
+    seen_pages = NULL;
+    if (page_count > 0u) {
+        pages = (pr_atlas_page_view_t *)calloc((size_t)page_count, sizeof(pages[0]));
+        seen_pages = (unsigned char *)calloc((size_t)page_count, sizeof(seen_pages[0]));
+        if (pages == NULL || seen_pages == NULL) {
+            free(pages);
+            free(seen_pages);
+            return PR_STATUS_ALLOCATION_FAILED;
+        }
+    }
+
     cursor = 28u;
     if (!pr_can_read(chunk->size, 0u, cursor)) {
+        free(pages);
+        free(seen_pages);
         return PR_STATUS_PARSE_ERROR;
     }
 
@@ -391,6 +421,8 @@ static pr_status_t pr_parse_chunk_txtr(
         uint32_t width;
         uint32_t height;
         uint32_t pixel_blob_size;
+        uint64_t expected_bytes64;
+        uint32_t stride;
 
         if (
             !pr_read_u32_le(chunk->payload, chunk->size, cursor + 0u, &page_index) ||
@@ -398,24 +430,68 @@ static pr_status_t pr_parse_chunk_txtr(
             !pr_read_u32_le(chunk->payload, chunk->size, cursor + 8u, &height) ||
             !pr_read_u32_le(chunk->payload, chunk->size, cursor + 12u, &pixel_blob_size)
         ) {
+            free(pages);
+            free(seen_pages);
             return PR_STATUS_PARSE_ERROR;
         }
-        (void)page_index;
-        (void)width;
-        (void)height;
 
         cursor += 16u;
         if (!pr_can_read(chunk->size, cursor, (size_t)pixel_blob_size)) {
+            free(pages);
+            free(seen_pages);
             return PR_STATUS_PARSE_ERROR;
         }
+
+        if (
+            page_index >= page_count ||
+            seen_pages[page_index] != 0u ||
+            width == 0u ||
+            height == 0u
+        ) {
+            free(pages);
+            free(seen_pages);
+            return PR_STATUS_PARSE_ERROR;
+        }
+
+        expected_bytes64 = (uint64_t)width * (uint64_t)height * 4u;
+        if (expected_bytes64 > (uint64_t)UINT32_MAX) {
+            free(pages);
+            free(seen_pages);
+            return PR_STATUS_PARSE_ERROR;
+        }
+        stride = width * 4u;
+        if (pixel_blob_size != 0u && pixel_blob_size != (uint32_t)expected_bytes64) {
+            free(pages);
+            free(seen_pages);
+            return PR_STATUS_PARSE_ERROR;
+        }
+
+        pages[page_index].width = width;
+        pages[page_index].height = height;
+        pages[page_index].stride = stride;
+        pages[page_index].pixel_bytes = pixel_blob_size;
+        pages[page_index].pixels = (pixel_blob_size > 0u) ? (chunk->payload + cursor) : NULL;
+        seen_pages[page_index] = 1u;
         cursor += (size_t)pixel_blob_size;
     }
 
     if (cursor != chunk->size) {
+        free(pages);
+        free(seen_pages);
         return PR_STATUS_PARSE_ERROR;
     }
+    for (i = 0u; i < page_count; ++i) {
+        if (seen_pages[i] == 0u) {
+            free(pages);
+            free(seen_pages);
+            return PR_STATUS_PARSE_ERROR;
+        }
+    }
 
+    free(seen_pages);
+    package->atlas_pages = pages;
     package->atlas_page_count = page_count;
+    package->has_txtr_chunk = 1;
     return PR_STATUS_OK;
 }
 
@@ -617,7 +693,13 @@ static pr_status_t pr_parse_chunk_sprt(
         frame->pivot_y = meta->pivot_y;
         frame_seen[target] = 1u;
 
-        if (atlas_page < UINT32_MAX) {
+        if (package->has_txtr_chunk != 0) {
+            if (atlas_page >= package->atlas_page_count) {
+                free(frame_seen);
+                free(sprite_meta);
+                return PR_STATUS_PARSE_ERROR;
+            }
+        } else if (atlas_page < UINT32_MAX) {
             uint32_t next_page;
 
             next_page = atlas_page + 1u;
@@ -637,7 +719,7 @@ static pr_status_t pr_parse_chunk_sprt(
         }
     }
 
-    if (max_page_plus_one > package->atlas_page_count) {
+    if (package->has_txtr_chunk == 0 && max_page_plus_one > package->atlas_page_count) {
         package->atlas_page_count = max_page_plus_one;
     }
 
@@ -1069,6 +1151,37 @@ unsigned int pr_package_atlas_page_count(const pr_package_t *package)
         return 0u;
     }
     return package->atlas_page_count;
+}
+
+const unsigned char *pr_package_atlas_page_pixels(
+    const pr_package_t *package,
+    unsigned int index,
+    unsigned int *out_width,
+    unsigned int *out_height,
+    unsigned int *out_stride
+)
+{
+    const pr_atlas_page_view_t *page;
+
+    if (
+        package == NULL ||
+        index >= package->atlas_page_count ||
+        package->atlas_pages == NULL
+    ) {
+        return NULL;
+    }
+
+    page = &package->atlas_pages[index];
+    if (out_width != NULL) {
+        *out_width = page->width;
+    }
+    if (out_height != NULL) {
+        *out_height = page->height;
+    }
+    if (out_stride != NULL) {
+        *out_stride = page->stride;
+    }
+    return page->pixels;
 }
 
 unsigned int pr_package_sprite_count(const pr_package_t *package)
