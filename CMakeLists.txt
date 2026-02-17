@@ -6,6 +6,7 @@ option(PACKRAT_BUILD_CLI "Build packrat CLI" ON)
 
 add_library(packrat
     src/build.c
+    src/manifest.c
     src/runtime.c
     src/status.c
 )
@@ -27,4 +28,3 @@ if(PACKRAT_BUILD_CLI)
     set_target_properties(packrat_cli PROPERTIES OUTPUT_NAME packrat)
     target_link_libraries(packrat_cli PRIVATE packrat)
 endif()
-

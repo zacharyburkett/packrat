@@ -22,7 +22,8 @@ It now also includes an initial C/CMake scaffold:
 
 - `packrat::packrat` static library target
 - `packrat` CLI executable
-- Minimal `validate` command wired to manifest sanity checks
+- Manifest parser + schema validator for the v0 image/sprite/animation schema
+- Package build path that writes a `.prpk` skeleton file
 
 ## Documents
 
@@ -42,10 +43,11 @@ cmake --build build
 
 ```sh
 ./build/packrat validate packrat.toml
+./build/packrat build packrat.toml
 ```
 
 Current implementation status:
 
-- `validate`: basic checks implemented (`schema_version`, `package_name`, `output`)
-- `build`: command/contract scaffolded, pipeline not implemented yet
+- `validate`: parses manifest sections and validates schema/references for v0
+- `build`: validates manifest and writes `.prpk` header/chunk-table skeleton (+ optional debug JSON)
 - `inspect`: command scaffolded, not implemented yet
