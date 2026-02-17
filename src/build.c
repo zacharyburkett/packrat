@@ -13,11 +13,14 @@
 
 #include "manifest.h"
 
-#define PR_CHUNK_COUNT_V0 2u
+#define PR_CHUNK_COUNT_V0 5u
 #define PR_PACKAGE_VERSION_MAJOR 1u
 #define PR_PACKAGE_VERSION_MINOR 0u
 
 #define PR_CHUNK_FORMAT_STRS "STRS"
+#define PR_CHUNK_FORMAT_TXTR "TXTR"
+#define PR_CHUNK_FORMAT_SPRT "SPRT"
+#define PR_CHUNK_FORMAT_ANIM "ANIM"
 #define PR_CHUNK_FORMAT_INDX "INDX"
 
 #define PR_IMAGE_FORMAT_UNKNOWN 0u
@@ -62,6 +65,61 @@ typedef struct pr_index_maps {
     uint32_t *sprite_source_image_idx;
     uint32_t *animation_sprite_idx;
 } pr_index_maps_t;
+
+typedef struct pr_resolved_sprite {
+    uint32_t source_image_index;
+    uint32_t name_str_idx;
+    uint32_t mode;
+    uint32_t first_frame;
+    uint32_t frame_count;
+    uint32_t pivot_x_milli;
+    uint32_t pivot_y_milli;
+} pr_resolved_sprite_t;
+
+typedef struct pr_resolved_frame {
+    uint32_t sprite_index;
+    uint32_t local_frame_index;
+    uint32_t source_x;
+    uint32_t source_y;
+    uint32_t source_w;
+    uint32_t source_h;
+    uint32_t atlas_page;
+    uint32_t atlas_x;
+    uint32_t atlas_y;
+    uint32_t atlas_w;
+    uint32_t atlas_h;
+    uint32_t u0_milli;
+    uint32_t v0_milli;
+    uint32_t u1_milli;
+    uint32_t v1_milli;
+} pr_resolved_frame_t;
+
+typedef struct pr_pack_page {
+    uint32_t max_w;
+    uint32_t max_h;
+    uint32_t used_w;
+    uint32_t used_h;
+    uint32_t cursor_x;
+    uint32_t cursor_y;
+    uint32_t shelf_h;
+    uint32_t final_w;
+    uint32_t final_h;
+} pr_pack_page_t;
+
+typedef struct pr_resolved_animation {
+    uint32_t name_str_idx;
+    uint32_t sprite_index;
+    uint32_t loop_mode;
+    uint32_t key_start;
+    uint32_t key_count;
+    uint32_t total_duration_ms;
+} pr_resolved_animation_t;
+
+typedef struct pr_resolved_animation_key {
+    uint32_t animation_index;
+    uint32_t frame_index;
+    uint32_t duration_ms;
+} pr_resolved_animation_key_t;
 
 static pr_build_result_storage_t PR_BUILD_RESULT_STORAGE;
 
@@ -540,6 +598,59 @@ static pr_status_t pr_import_manifest_images(
     return PR_STATUS_OK;
 }
 
+static int pr_reserve_array(
+    void **buffer,
+    size_t *capacity,
+    size_t needed_count,
+    size_t element_size
+)
+{
+    size_t new_capacity;
+    void *grown;
+
+    if (
+        buffer == NULL ||
+        capacity == NULL ||
+        element_size == 0u
+    ) {
+        return 0;
+    }
+    if (needed_count <= *capacity) {
+        return 1;
+    }
+
+    new_capacity = (*capacity == 0u) ? 16u : *capacity;
+    while (new_capacity < needed_count) {
+        new_capacity *= 2u;
+    }
+
+    grown = realloc(*buffer, new_capacity * element_size);
+    if (grown == NULL) {
+        return 0;
+    }
+
+    *buffer = grown;
+    *capacity = new_capacity;
+    return 1;
+}
+
+static uint32_t pr_round_up_pow2_u32(uint32_t value)
+{
+    uint32_t v;
+
+    if (value <= 1u) {
+        return 1u;
+    }
+
+    v = value - 1u;
+    v |= v >> 1u;
+    v |= v >> 2u;
+    v |= v >> 4u;
+    v |= v >> 8u;
+    v |= v >> 16u;
+    return v + 1u;
+}
+
 static void pr_byte_buffer_init(pr_byte_buffer_t *buffer)
 {
     if (buffer == NULL) {
@@ -746,48 +857,6 @@ static long pr_find_sprite_index(const pr_manifest_t *manifest, const char *spri
     return -1;
 }
 
-static uint32_t pr_sprite_frame_count_hint(const pr_manifest_sprite_t *sprite)
-{
-    if (sprite == NULL) {
-        return 0u;
-    }
-
-    switch (sprite->mode) {
-    case PR_MANIFEST_SPRITE_MODE_SINGLE:
-        return 1u;
-    case PR_MANIFEST_SPRITE_MODE_RECTS:
-        return (uint32_t)sprite->rect_count;
-    case PR_MANIFEST_SPRITE_MODE_GRID:
-        if (sprite->has_frame_count != 0 && sprite->frame_count > 0) {
-            return (uint32_t)sprite->frame_count;
-        }
-        return 0u;
-    default:
-        return 0u;
-    }
-}
-
-static uint32_t pr_animation_total_duration_ms(const pr_manifest_animation_t *animation)
-{
-    size_t i;
-    uint64_t total;
-
-    if (animation == NULL) {
-        return 0u;
-    }
-
-    total = 0u;
-    for (i = 0u; i < animation->frame_count; ++i) {
-        if (animation->frames[i].ms > 0) {
-            total += (uint64_t)animation->frames[i].ms;
-        }
-    }
-    if (total > 0xFFFFFFFFu) {
-        total = 0xFFFFFFFFu;
-    }
-    return (uint32_t)total;
-}
-
 static uint32_t pr_pivot_to_milli(double pivot)
 {
     long value;
@@ -806,6 +875,741 @@ static uint32_t pr_pivot_to_milli(double pivot)
         value = 1000L;
     }
     return (uint32_t)value;
+}
+
+static int pr_append_resolved_frame(
+    pr_resolved_frame_t **frames,
+    size_t *frame_count,
+    size_t *frame_capacity,
+    const pr_resolved_frame_t *frame
+)
+{
+    if (
+        frames == NULL ||
+        frame_count == NULL ||
+        frame_capacity == NULL ||
+        frame == NULL
+    ) {
+        return 0;
+    }
+
+    if (!pr_reserve_array(
+            (void **)frames,
+            frame_capacity,
+            *frame_count + 1u,
+            sizeof((*frames)[0])
+        )) {
+        return 0;
+    }
+
+    (*frames)[*frame_count] = *frame;
+    *frame_count += 1u;
+    return 1;
+}
+
+static pr_status_t pr_resolve_sprite_frames(
+    const pr_manifest_t *manifest,
+    const pr_imported_image_t *images,
+    const pr_index_maps_t *maps,
+    const char *manifest_path,
+    pr_diag_sink_fn diag_sink,
+    void *diag_user_data,
+    pr_resolved_sprite_t **out_sprites,
+    size_t *out_sprite_count,
+    pr_resolved_frame_t **out_frames,
+    size_t *out_frame_count
+)
+{
+    pr_resolved_sprite_t *sprites;
+    pr_resolved_frame_t *frames;
+    size_t frame_count;
+    size_t frame_capacity;
+    size_t sprite_index;
+
+    if (
+        manifest == NULL ||
+        (manifest->sprite_count > 0u && images == NULL) ||
+        maps == NULL ||
+        out_sprites == NULL ||
+        out_sprite_count == NULL ||
+        out_frames == NULL ||
+        out_frame_count == NULL
+    ) {
+        return PR_STATUS_INVALID_ARGUMENT;
+    }
+
+    *out_sprites = NULL;
+    *out_sprite_count = 0u;
+    *out_frames = NULL;
+    *out_frame_count = 0u;
+
+    if (manifest->sprite_count == 0u) {
+        return PR_STATUS_OK;
+    }
+
+    sprites = (pr_resolved_sprite_t *)calloc(
+        manifest->sprite_count,
+        sizeof(sprites[0])
+    );
+    if (sprites == NULL) {
+        return PR_STATUS_ALLOCATION_FAILED;
+    }
+
+    frames = NULL;
+    frame_count = 0u;
+    frame_capacity = 0u;
+
+    for (sprite_index = 0u; sprite_index < manifest->sprite_count; ++sprite_index) {
+        const pr_manifest_sprite_t *sprite;
+        const pr_imported_image_t *image;
+        pr_resolved_sprite_t *resolved;
+        uint32_t source_image_index;
+        uint32_t local_frame_index;
+
+        sprite = &manifest->sprites[sprite_index];
+        source_image_index = maps->sprite_source_image_idx[sprite_index];
+        if (source_image_index >= manifest->image_count) {
+            free(frames);
+            free(sprites);
+            return PR_STATUS_INTERNAL_ERROR;
+        }
+        image = &images[source_image_index];
+        resolved = &sprites[sprite_index];
+        resolved->source_image_index = source_image_index;
+        resolved->name_str_idx = maps->sprite_id_str_idx[sprite_index];
+        resolved->mode = (uint32_t)sprite->mode;
+        resolved->first_frame = (uint32_t)frame_count;
+        resolved->frame_count = 0u;
+        resolved->pivot_x_milli = pr_pivot_to_milli(sprite->pivot_x);
+        resolved->pivot_y_milli = pr_pivot_to_milli(sprite->pivot_y);
+        local_frame_index = 0u;
+
+        if (sprite->mode == PR_MANIFEST_SPRITE_MODE_SINGLE) {
+            pr_resolved_frame_t frame;
+            uint32_t x;
+            uint32_t y;
+            uint32_t w;
+            uint32_t h;
+
+            x = (sprite->has_x != 0 && sprite->x > 0) ? (uint32_t)sprite->x : 0u;
+            y = (sprite->has_y != 0 && sprite->y > 0) ? (uint32_t)sprite->y : 0u;
+            w = (sprite->has_w != 0 && sprite->w > 0) ? (uint32_t)sprite->w : image->width;
+            h = (sprite->has_h != 0 && sprite->h > 0) ? (uint32_t)sprite->h : image->height;
+
+            if (x + w > image->width || y + h > image->height) {
+                free(frames);
+                free(sprites);
+                pr_emit_diag(
+                    diag_sink,
+                    diag_user_data,
+                    PR_DIAG_ERROR,
+                    "Single sprite source rectangle exceeds source image bounds.",
+                    image->resolved_path,
+                    "build.sprite.single_rect_oob",
+                    sprite->id
+                );
+                return PR_STATUS_VALIDATION_ERROR;
+            }
+
+            memset(&frame, 0, sizeof(frame));
+            frame.sprite_index = (uint32_t)sprite_index;
+            frame.local_frame_index = local_frame_index++;
+            frame.source_x = x;
+            frame.source_y = y;
+            frame.source_w = w;
+            frame.source_h = h;
+            frame.atlas_w = w;
+            frame.atlas_h = h;
+            if (!pr_append_resolved_frame(&frames, &frame_count, &frame_capacity, &frame)) {
+                free(frames);
+                free(sprites);
+                return PR_STATUS_ALLOCATION_FAILED;
+            }
+        } else if (sprite->mode == PR_MANIFEST_SPRITE_MODE_RECTS) {
+            size_t rect_index;
+
+            for (rect_index = 0u; rect_index < sprite->rect_count; ++rect_index) {
+                const pr_manifest_sprite_rect_t *rect;
+                pr_resolved_frame_t frame;
+                uint32_t x;
+                uint32_t y;
+                uint32_t w;
+                uint32_t h;
+
+                rect = &sprite->rects[rect_index];
+                x = (uint32_t)rect->x;
+                y = (uint32_t)rect->y;
+                w = (uint32_t)rect->w;
+                h = (uint32_t)rect->h;
+
+                if (x + w > image->width || y + h > image->height) {
+                    free(frames);
+                    free(sprites);
+                    pr_emit_diag(
+                        diag_sink,
+                        diag_user_data,
+                        PR_DIAG_ERROR,
+                        "Rect sprite source rectangle exceeds source image bounds.",
+                        image->resolved_path,
+                        "build.sprite.rect_oob",
+                        sprite->id
+                    );
+                    return PR_STATUS_VALIDATION_ERROR;
+                }
+
+                memset(&frame, 0, sizeof(frame));
+                frame.sprite_index = (uint32_t)sprite_index;
+                frame.local_frame_index = local_frame_index++;
+                frame.source_x = x;
+                frame.source_y = y;
+                frame.source_w = w;
+                frame.source_h = h;
+                frame.atlas_w = w;
+                frame.atlas_h = h;
+                if (!pr_append_resolved_frame(&frames, &frame_count, &frame_capacity, &frame)) {
+                    free(frames);
+                    free(sprites);
+                    return PR_STATUS_ALLOCATION_FAILED;
+                }
+            }
+        } else if (sprite->mode == PR_MANIFEST_SPRITE_MODE_GRID) {
+            uint32_t margin_x;
+            uint32_t margin_y;
+            uint32_t spacing_x;
+            uint32_t spacing_y;
+            uint32_t cell_w;
+            uint32_t cell_h;
+            uint32_t cols;
+            uint32_t rows;
+            uint32_t total_cells;
+            uint32_t frame_start;
+            uint32_t frame_count_target;
+            uint32_t i;
+
+            margin_x = (sprite->has_margin_x != 0 && sprite->margin_x > 0) ?
+                (uint32_t)sprite->margin_x : 0u;
+            margin_y = (sprite->has_margin_y != 0 && sprite->margin_y > 0) ?
+                (uint32_t)sprite->margin_y : 0u;
+            spacing_x = (sprite->has_spacing_x != 0 && sprite->spacing_x > 0) ?
+                (uint32_t)sprite->spacing_x : 0u;
+            spacing_y = (sprite->has_spacing_y != 0 && sprite->spacing_y > 0) ?
+                (uint32_t)sprite->spacing_y : 0u;
+            cell_w = (uint32_t)sprite->cell_w;
+            cell_h = (uint32_t)sprite->cell_h;
+
+            if (image->width < margin_x + cell_w || image->height < margin_y + cell_h) {
+                free(frames);
+                free(sprites);
+                pr_emit_diag(
+                    diag_sink,
+                    diag_user_data,
+                    PR_DIAG_ERROR,
+                    "Grid sprite has no valid cells in source image.",
+                    image->resolved_path,
+                    "build.sprite.grid_no_cells",
+                    sprite->id
+                );
+                return PR_STATUS_VALIDATION_ERROR;
+            }
+
+            cols = 1u + (image->width - margin_x - cell_w) / (cell_w + spacing_x);
+            rows = 1u + (image->height - margin_y - cell_h) / (cell_h + spacing_y);
+            total_cells = cols * rows;
+            frame_start = (sprite->has_frame_start != 0 && sprite->frame_start > 0) ?
+                (uint32_t)sprite->frame_start : 0u;
+            if (frame_start >= total_cells) {
+                free(frames);
+                free(sprites);
+                pr_emit_diag(
+                    diag_sink,
+                    diag_user_data,
+                    PR_DIAG_ERROR,
+                    "Grid sprite frame_start exceeds available cell count.",
+                    image->resolved_path,
+                    "build.sprite.grid_frame_start_oob",
+                    sprite->id
+                );
+                return PR_STATUS_VALIDATION_ERROR;
+            }
+
+            if (sprite->has_frame_count != 0) {
+                frame_count_target = (uint32_t)sprite->frame_count;
+            } else {
+                frame_count_target = total_cells - frame_start;
+            }
+
+            if (frame_start + frame_count_target > total_cells) {
+                free(frames);
+                free(sprites);
+                pr_emit_diag(
+                    diag_sink,
+                    diag_user_data,
+                    PR_DIAG_ERROR,
+                    "Grid sprite frame range exceeds available cell count.",
+                    image->resolved_path,
+                    "build.sprite.grid_frame_count_oob",
+                    sprite->id
+                );
+                return PR_STATUS_VALIDATION_ERROR;
+            }
+
+            for (i = 0u; i < frame_count_target; ++i) {
+                uint32_t cell_index;
+                uint32_t row;
+                uint32_t col;
+                pr_resolved_frame_t frame;
+
+                cell_index = frame_start + i;
+                row = cell_index / cols;
+                col = cell_index % cols;
+
+                memset(&frame, 0, sizeof(frame));
+                frame.sprite_index = (uint32_t)sprite_index;
+                frame.local_frame_index = local_frame_index++;
+                frame.source_x = margin_x + col * (cell_w + spacing_x);
+                frame.source_y = margin_y + row * (cell_h + spacing_y);
+                frame.source_w = cell_w;
+                frame.source_h = cell_h;
+                frame.atlas_w = cell_w;
+                frame.atlas_h = cell_h;
+                if (!pr_append_resolved_frame(&frames, &frame_count, &frame_capacity, &frame)) {
+                    free(frames);
+                    free(sprites);
+                    return PR_STATUS_ALLOCATION_FAILED;
+                }
+            }
+        } else {
+            free(frames);
+            free(sprites);
+            return PR_STATUS_VALIDATION_ERROR;
+        }
+
+        resolved->frame_count = (uint32_t)(frame_count - (size_t)resolved->first_frame);
+        if (resolved->frame_count == 0u) {
+            free(frames);
+            free(sprites);
+            pr_emit_diag(
+                diag_sink,
+                diag_user_data,
+                PR_DIAG_ERROR,
+                "Sprite resolved to zero frames.",
+                manifest_path,
+                "build.sprite.zero_frames",
+                sprite->id
+            );
+            return PR_STATUS_VALIDATION_ERROR;
+        }
+    }
+
+    *out_sprites = sprites;
+    *out_sprite_count = manifest->sprite_count;
+    *out_frames = frames;
+    *out_frame_count = frame_count;
+    return PR_STATUS_OK;
+}
+
+static int pr_place_frame_in_page(
+    pr_pack_page_t *page,
+    uint32_t padded_w,
+    uint32_t padded_h,
+    uint32_t padding,
+    uint32_t *out_x,
+    uint32_t *out_y
+)
+{
+    uint32_t place_x;
+    uint32_t place_y;
+
+    if (
+        page == NULL ||
+        out_x == NULL ||
+        out_y == NULL ||
+        padded_w == 0u ||
+        padded_h == 0u
+    ) {
+        return 0;
+    }
+    if (padded_w > page->max_w || padded_h > page->max_h) {
+        return 0;
+    }
+
+    if (page->cursor_x + padded_w > page->max_w) {
+        if (page->cursor_y + page->shelf_h + padded_h > page->max_h) {
+            return 0;
+        }
+        page->cursor_y += page->shelf_h;
+        page->cursor_x = 0u;
+        page->shelf_h = 0u;
+    }
+
+    if (page->cursor_y + padded_h > page->max_h) {
+        return 0;
+    }
+
+    place_x = page->cursor_x;
+    place_y = page->cursor_y;
+    page->cursor_x += padded_w;
+    if (padded_h > page->shelf_h) {
+        page->shelf_h = padded_h;
+    }
+
+    if (place_x + padded_w > page->used_w) {
+        page->used_w = place_x + padded_w;
+    }
+    if (place_y + padded_h > page->used_h) {
+        page->used_h = place_y + padded_h;
+    }
+
+    *out_x = place_x + padding;
+    *out_y = place_y + padding;
+    return 1;
+}
+
+typedef struct pr_pack_item {
+    uint32_t frame_index;
+    uint32_t padded_w;
+    uint32_t padded_h;
+    uint64_t area;
+    uint32_t sprite_index;
+    uint32_t local_frame_index;
+} pr_pack_item_t;
+
+static int pr_pack_item_compare(const void *lhs, const void *rhs)
+{
+    const pr_pack_item_t *a;
+    const pr_pack_item_t *b;
+
+    a = (const pr_pack_item_t *)lhs;
+    b = (const pr_pack_item_t *)rhs;
+
+    if (a->area != b->area) {
+        return (a->area < b->area) ? 1 : -1;
+    }
+    if (a->padded_h != b->padded_h) {
+        return (a->padded_h < b->padded_h) ? 1 : -1;
+    }
+    if (a->padded_w != b->padded_w) {
+        return (a->padded_w < b->padded_w) ? 1 : -1;
+    }
+    if (a->sprite_index != b->sprite_index) {
+        return (a->sprite_index > b->sprite_index) ? 1 : -1;
+    }
+    if (a->local_frame_index != b->local_frame_index) {
+        return (a->local_frame_index > b->local_frame_index) ? 1 : -1;
+    }
+    return 0;
+}
+
+static pr_status_t pr_pack_resolved_frames(
+    const pr_manifest_t *manifest,
+    pr_resolved_frame_t *frames,
+    size_t frame_count,
+    pr_diag_sink_fn diag_sink,
+    void *diag_user_data,
+    pr_pack_page_t **out_pages,
+    size_t *out_page_count
+)
+{
+    pr_pack_page_t *pages;
+    size_t page_count;
+    size_t page_capacity;
+    pr_pack_item_t *items;
+    size_t i;
+    uint32_t padding;
+
+    if (
+        manifest == NULL ||
+        (frame_count > 0u && frames == NULL) ||
+        out_pages == NULL ||
+        out_page_count == NULL
+    ) {
+        return PR_STATUS_INVALID_ARGUMENT;
+    }
+
+    *out_pages = NULL;
+    *out_page_count = 0u;
+    if (frame_count == 0u) {
+        return PR_STATUS_OK;
+    }
+
+    padding = (manifest->atlas.padding > 0) ? (uint32_t)manifest->atlas.padding : 0u;
+    pages = NULL;
+    page_count = 0u;
+    page_capacity = 0u;
+    items = (pr_pack_item_t *)calloc(frame_count, sizeof(items[0]));
+    if (items == NULL) {
+        return PR_STATUS_ALLOCATION_FAILED;
+    }
+
+    for (i = 0u; i < frame_count; ++i) {
+        uint32_t padded_w;
+        uint32_t padded_h;
+
+        padded_w = frames[i].source_w + padding * 2u;
+        padded_h = frames[i].source_h + padding * 2u;
+        if (
+            padded_w > (uint32_t)manifest->atlas.max_page_width ||
+            padded_h > (uint32_t)manifest->atlas.max_page_height
+        ) {
+            free(items);
+            pr_emit_diag(
+                diag_sink,
+                diag_user_data,
+                PR_DIAG_ERROR,
+                "Frame is too large for atlas page constraints.",
+                NULL,
+                "build.atlas.frame_too_large",
+                NULL
+            );
+            return PR_STATUS_VALIDATION_ERROR;
+        }
+        items[i].frame_index = (uint32_t)i;
+        items[i].padded_w = padded_w;
+        items[i].padded_h = padded_h;
+        items[i].area = (uint64_t)padded_w * (uint64_t)padded_h;
+        items[i].sprite_index = frames[i].sprite_index;
+        items[i].local_frame_index = frames[i].local_frame_index;
+    }
+
+    qsort(items, frame_count, sizeof(items[0]), pr_pack_item_compare);
+
+    for (i = 0u; i < frame_count; ++i) {
+        size_t page_index;
+        int placed;
+
+        placed = 0;
+        for (page_index = 0u; page_index < page_count; ++page_index) {
+            uint32_t atlas_x;
+            uint32_t atlas_y;
+
+            if (!pr_place_frame_in_page(
+                    &pages[page_index],
+                    items[i].padded_w,
+                    items[i].padded_h,
+                    padding,
+                    &atlas_x,
+                    &atlas_y
+                )) {
+                continue;
+            }
+
+            frames[items[i].frame_index].atlas_page = (uint32_t)page_index;
+            frames[items[i].frame_index].atlas_x = atlas_x;
+            frames[items[i].frame_index].atlas_y = atlas_y;
+            placed = 1;
+            break;
+        }
+
+        if (placed != 0) {
+            continue;
+        }
+
+        if (!pr_reserve_array(
+                (void **)&pages,
+                &page_capacity,
+                page_count + 1u,
+                sizeof(pages[0])
+            )) {
+            free(items);
+            free(pages);
+            return PR_STATUS_ALLOCATION_FAILED;
+        }
+
+        memset(&pages[page_count], 0, sizeof(pages[0]));
+        pages[page_count].max_w = (uint32_t)manifest->atlas.max_page_width;
+        pages[page_count].max_h = (uint32_t)manifest->atlas.max_page_height;
+
+        {
+            uint32_t atlas_x;
+            uint32_t atlas_y;
+
+            if (!pr_place_frame_in_page(
+                    &pages[page_count],
+                    items[i].padded_w,
+                    items[i].padded_h,
+                    padding,
+                    &atlas_x,
+                    &atlas_y
+                )) {
+                free(items);
+                free(pages);
+                return PR_STATUS_VALIDATION_ERROR;
+            }
+
+            frames[items[i].frame_index].atlas_page = (uint32_t)page_count;
+            frames[items[i].frame_index].atlas_x = atlas_x;
+            frames[items[i].frame_index].atlas_y = atlas_y;
+        }
+        page_count += 1u;
+    }
+
+    for (i = 0u; i < page_count; ++i) {
+        uint32_t final_w;
+        uint32_t final_h;
+
+        final_w = (pages[i].used_w > 0u) ? pages[i].used_w : 1u;
+        final_h = (pages[i].used_h > 0u) ? pages[i].used_h : 1u;
+        if (manifest->atlas.power_of_two != 0) {
+            final_w = pr_round_up_pow2_u32(final_w);
+            final_h = pr_round_up_pow2_u32(final_h);
+            if (final_w > pages[i].max_w) {
+                final_w = pages[i].max_w;
+            }
+            if (final_h > pages[i].max_h) {
+                final_h = pages[i].max_h;
+            }
+        }
+        pages[i].final_w = final_w;
+        pages[i].final_h = final_h;
+    }
+
+    for (i = 0u; i < frame_count; ++i) {
+        pr_pack_page_t *page;
+
+        page = &pages[frames[i].atlas_page];
+        frames[i].atlas_w = frames[i].source_w;
+        frames[i].atlas_h = frames[i].source_h;
+        frames[i].u0_milli = (uint32_t)(((uint64_t)frames[i].atlas_x * 1000000u) / page->final_w);
+        frames[i].v0_milli = (uint32_t)(((uint64_t)frames[i].atlas_y * 1000000u) / page->final_h);
+        frames[i].u1_milli = (uint32_t)(((uint64_t)(frames[i].atlas_x + frames[i].atlas_w) * 1000000u) / page->final_w);
+        frames[i].v1_milli = (uint32_t)(((uint64_t)(frames[i].atlas_y + frames[i].atlas_h) * 1000000u) / page->final_h);
+    }
+
+    free(items);
+    *out_pages = pages;
+    *out_page_count = page_count;
+    return PR_STATUS_OK;
+}
+
+static pr_status_t pr_resolve_animations(
+    const pr_manifest_t *manifest,
+    const pr_index_maps_t *maps,
+    const pr_resolved_sprite_t *sprites,
+    size_t sprite_count,
+    pr_diag_sink_fn diag_sink,
+    void *diag_user_data,
+    pr_resolved_animation_t **out_animations,
+    size_t *out_animation_count,
+    pr_resolved_animation_key_t **out_keys,
+    size_t *out_key_count
+)
+{
+    pr_resolved_animation_t *animations;
+    pr_resolved_animation_key_t *keys;
+    size_t key_count;
+    size_t key_capacity;
+    size_t animation_index;
+
+    if (
+        manifest == NULL ||
+        maps == NULL ||
+        out_animations == NULL ||
+        out_animation_count == NULL ||
+        out_keys == NULL ||
+        out_key_count == NULL
+    ) {
+        return PR_STATUS_INVALID_ARGUMENT;
+    }
+    if (
+        manifest->sprite_count != sprite_count ||
+        (manifest->animation_count > 0u && sprites == NULL)
+    ) {
+        return PR_STATUS_INVALID_ARGUMENT;
+    }
+
+    *out_animations = NULL;
+    *out_animation_count = 0u;
+    *out_keys = NULL;
+    *out_key_count = 0u;
+
+    if (manifest->animation_count == 0u) {
+        return PR_STATUS_OK;
+    }
+
+    animations = (pr_resolved_animation_t *)calloc(
+        manifest->animation_count,
+        sizeof(animations[0])
+    );
+    if (animations == NULL) {
+        return PR_STATUS_ALLOCATION_FAILED;
+    }
+
+    keys = NULL;
+    key_count = 0u;
+    key_capacity = 0u;
+
+    for (animation_index = 0u; animation_index < manifest->animation_count; ++animation_index) {
+        const pr_manifest_animation_t *animation;
+        const pr_resolved_sprite_t *sprite;
+        pr_resolved_animation_t *resolved;
+        size_t frame_index;
+        uint32_t total_duration;
+
+        animation = &manifest->animations[animation_index];
+        resolved = &animations[animation_index];
+        resolved->name_str_idx = maps->animation_id_str_idx[animation_index];
+        resolved->sprite_index = maps->animation_sprite_idx[animation_index];
+        resolved->loop_mode = (uint32_t)animation->loop_mode;
+        resolved->key_start = (uint32_t)key_count;
+        resolved->key_count = 0u;
+        resolved->total_duration_ms = 0u;
+
+        if (resolved->sprite_index >= manifest->sprite_count) {
+            free(keys);
+            free(animations);
+            return PR_STATUS_INTERNAL_ERROR;
+        }
+        sprite = &sprites[resolved->sprite_index];
+        total_duration = 0u;
+
+        for (frame_index = 0u; frame_index < animation->frame_count; ++frame_index) {
+            const pr_manifest_animation_frame_t *frame;
+            pr_resolved_animation_key_t key;
+
+            frame = &animation->frames[frame_index];
+            if ((uint32_t)frame->index >= sprite->frame_count) {
+                free(keys);
+                free(animations);
+                pr_emit_diag(
+                    diag_sink,
+                    diag_user_data,
+                    PR_DIAG_ERROR,
+                    "Animation frame index exceeds resolved sprite frame count.",
+                    NULL,
+                    "build.animation.frame_index_oob",
+                    animation->id
+                );
+                return PR_STATUS_VALIDATION_ERROR;
+            }
+
+            if (!pr_reserve_array(
+                    (void **)&keys,
+                    &key_capacity,
+                    key_count + 1u,
+                    sizeof(keys[0])
+                )) {
+                free(keys);
+                free(animations);
+                return PR_STATUS_ALLOCATION_FAILED;
+            }
+
+            key.animation_index = (uint32_t)animation_index;
+            key.frame_index = (uint32_t)frame->index;
+            key.duration_ms = (frame->ms > 0) ? (uint32_t)frame->ms : 0u;
+            keys[key_count] = key;
+            key_count += 1u;
+            resolved->key_count += 1u;
+            total_duration += key.duration_ms;
+        }
+
+        resolved->total_duration_ms = total_duration;
+    }
+
+    *out_animations = animations;
+    *out_animation_count = manifest->animation_count;
+    *out_keys = keys;
+    *out_key_count = key_count;
+    return PR_STATUS_OK;
 }
 
 static int pr_allocate_index_maps(
@@ -1006,10 +1810,18 @@ static int pr_build_chunk_strs(
     return 1;
 }
 
-static int pr_build_chunk_indx(
+static uint32_t pr_atlas_sampling_code(const char *sampling)
+{
+    if (sampling != NULL && strcmp(sampling, "linear") == 0) {
+        return 1u;
+    }
+    return 0u;
+}
+
+static int pr_build_chunk_txtr(
     const pr_manifest_t *manifest,
-    const pr_imported_image_t *images,
-    const pr_index_maps_t *maps,
+    const pr_pack_page_t *pages,
+    size_t page_count,
     pr_chunk_payload_t *chunk
 )
 {
@@ -1018,8 +1830,199 @@ static int pr_build_chunk_indx(
 
     if (
         manifest == NULL ||
-        images == NULL ||
+        (page_count > 0u && pages == NULL) ||
+        chunk == NULL
+    ) {
+        return 0;
+    }
+
+    pr_byte_buffer_init(&buffer);
+    if (
+        !pr_byte_buffer_append_u32_le(&buffer, 1u) ||
+        !pr_byte_buffer_append_u32_le(&buffer, (uint32_t)page_count) ||
+        !pr_byte_buffer_append_u32_le(&buffer, (uint32_t)manifest->atlas.max_page_width) ||
+        !pr_byte_buffer_append_u32_le(&buffer, (uint32_t)manifest->atlas.max_page_height) ||
+        !pr_byte_buffer_append_u32_le(&buffer, (uint32_t)manifest->atlas.padding) ||
+        !pr_byte_buffer_append_u32_le(&buffer, (uint32_t)(manifest->atlas.power_of_two != 0)) ||
+        !pr_byte_buffer_append_u32_le(&buffer, pr_atlas_sampling_code(manifest->atlas.sampling))
+    ) {
+        pr_byte_buffer_free(&buffer);
+        return 0;
+    }
+
+    for (i = 0u; i < page_count; ++i) {
+        if (
+            !pr_byte_buffer_append_u32_le(&buffer, (uint32_t)i) ||
+            !pr_byte_buffer_append_u32_le(&buffer, pages[i].final_w) ||
+            !pr_byte_buffer_append_u32_le(&buffer, pages[i].final_h) ||
+            !pr_byte_buffer_append_u32_le(&buffer, 0u)
+        ) {
+            pr_byte_buffer_free(&buffer);
+            return 0;
+        }
+    }
+
+    memcpy(chunk->id, PR_CHUNK_FORMAT_TXTR, 4u);
+    chunk->bytes = buffer.data;
+    chunk->size = buffer.size;
+    return 1;
+}
+
+static int pr_build_chunk_sprt(
+    const pr_resolved_sprite_t *sprites,
+    size_t sprite_count,
+    const pr_resolved_frame_t *frames,
+    size_t frame_count,
+    pr_chunk_payload_t *chunk
+)
+{
+    pr_byte_buffer_t buffer;
+    size_t i;
+
+    if (
+        (sprite_count > 0u && sprites == NULL) ||
+        (frame_count > 0u && frames == NULL) ||
+        chunk == NULL
+    ) {
+        return 0;
+    }
+
+    pr_byte_buffer_init(&buffer);
+    if (
+        !pr_byte_buffer_append_u32_le(&buffer, 1u) ||
+        !pr_byte_buffer_append_u32_le(&buffer, (uint32_t)sprite_count) ||
+        !pr_byte_buffer_append_u32_le(&buffer, (uint32_t)frame_count)
+    ) {
+        pr_byte_buffer_free(&buffer);
+        return 0;
+    }
+
+    for (i = 0u; i < sprite_count; ++i) {
+        if (
+            !pr_byte_buffer_append_u32_le(&buffer, sprites[i].name_str_idx) ||
+            !pr_byte_buffer_append_u32_le(&buffer, sprites[i].source_image_index) ||
+            !pr_byte_buffer_append_u32_le(&buffer, sprites[i].mode) ||
+            !pr_byte_buffer_append_u32_le(&buffer, sprites[i].first_frame) ||
+            !pr_byte_buffer_append_u32_le(&buffer, sprites[i].frame_count) ||
+            !pr_byte_buffer_append_u32_le(&buffer, sprites[i].pivot_x_milli) ||
+            !pr_byte_buffer_append_u32_le(&buffer, sprites[i].pivot_y_milli)
+        ) {
+            pr_byte_buffer_free(&buffer);
+            return 0;
+        }
+    }
+
+    for (i = 0u; i < frame_count; ++i) {
+        if (
+            !pr_byte_buffer_append_u32_le(&buffer, frames[i].sprite_index) ||
+            !pr_byte_buffer_append_u32_le(&buffer, frames[i].local_frame_index) ||
+            !pr_byte_buffer_append_u32_le(&buffer, frames[i].source_x) ||
+            !pr_byte_buffer_append_u32_le(&buffer, frames[i].source_y) ||
+            !pr_byte_buffer_append_u32_le(&buffer, frames[i].source_w) ||
+            !pr_byte_buffer_append_u32_le(&buffer, frames[i].source_h) ||
+            !pr_byte_buffer_append_u32_le(&buffer, frames[i].atlas_page) ||
+            !pr_byte_buffer_append_u32_le(&buffer, frames[i].atlas_x) ||
+            !pr_byte_buffer_append_u32_le(&buffer, frames[i].atlas_y) ||
+            !pr_byte_buffer_append_u32_le(&buffer, frames[i].atlas_w) ||
+            !pr_byte_buffer_append_u32_le(&buffer, frames[i].atlas_h) ||
+            !pr_byte_buffer_append_u32_le(&buffer, frames[i].u0_milli) ||
+            !pr_byte_buffer_append_u32_le(&buffer, frames[i].v0_milli) ||
+            !pr_byte_buffer_append_u32_le(&buffer, frames[i].u1_milli) ||
+            !pr_byte_buffer_append_u32_le(&buffer, frames[i].v1_milli)
+        ) {
+            pr_byte_buffer_free(&buffer);
+            return 0;
+        }
+    }
+
+    memcpy(chunk->id, PR_CHUNK_FORMAT_SPRT, 4u);
+    chunk->bytes = buffer.data;
+    chunk->size = buffer.size;
+    return 1;
+}
+
+static int pr_build_chunk_anim(
+    const pr_resolved_animation_t *animations,
+    size_t animation_count,
+    const pr_resolved_animation_key_t *keys,
+    size_t key_count,
+    pr_chunk_payload_t *chunk
+)
+{
+    pr_byte_buffer_t buffer;
+    size_t i;
+
+    if (
+        (animation_count > 0u && animations == NULL) ||
+        (key_count > 0u && keys == NULL) ||
+        chunk == NULL
+    ) {
+        return 0;
+    }
+
+    pr_byte_buffer_init(&buffer);
+    if (
+        !pr_byte_buffer_append_u32_le(&buffer, 1u) ||
+        !pr_byte_buffer_append_u32_le(&buffer, (uint32_t)animation_count) ||
+        !pr_byte_buffer_append_u32_le(&buffer, (uint32_t)key_count)
+    ) {
+        pr_byte_buffer_free(&buffer);
+        return 0;
+    }
+
+    for (i = 0u; i < animation_count; ++i) {
+        if (
+            !pr_byte_buffer_append_u32_le(&buffer, animations[i].name_str_idx) ||
+            !pr_byte_buffer_append_u32_le(&buffer, animations[i].sprite_index) ||
+            !pr_byte_buffer_append_u32_le(&buffer, animations[i].loop_mode) ||
+            !pr_byte_buffer_append_u32_le(&buffer, animations[i].key_start) ||
+            !pr_byte_buffer_append_u32_le(&buffer, animations[i].key_count) ||
+            !pr_byte_buffer_append_u32_le(&buffer, animations[i].total_duration_ms)
+        ) {
+            pr_byte_buffer_free(&buffer);
+            return 0;
+        }
+    }
+
+    for (i = 0u; i < key_count; ++i) {
+        if (
+            !pr_byte_buffer_append_u32_le(&buffer, keys[i].animation_index) ||
+            !pr_byte_buffer_append_u32_le(&buffer, keys[i].frame_index) ||
+            !pr_byte_buffer_append_u32_le(&buffer, keys[i].duration_ms)
+        ) {
+            pr_byte_buffer_free(&buffer);
+            return 0;
+        }
+    }
+
+    memcpy(chunk->id, PR_CHUNK_FORMAT_ANIM, 4u);
+    chunk->bytes = buffer.data;
+    chunk->size = buffer.size;
+    return 1;
+}
+
+static int pr_build_chunk_indx(
+    const pr_manifest_t *manifest,
+    const pr_imported_image_t *images,
+    const pr_index_maps_t *maps,
+    const pr_resolved_sprite_t *sprites,
+    size_t sprite_count,
+    const pr_resolved_animation_t *animations,
+    size_t animation_count,
+    pr_chunk_payload_t *chunk
+)
+{
+    pr_byte_buffer_t buffer;
+    size_t i;
+
+    if (
+        manifest == NULL ||
+        (manifest->image_count > 0u && images == NULL) ||
         maps == NULL ||
+        sprite_count != manifest->sprite_count ||
+        animation_count != manifest->animation_count ||
+        (sprite_count > 0u && sprites == NULL) ||
+        (animation_count > 0u && animations == NULL) ||
         chunk == NULL
     ) {
         return 0;
@@ -1049,33 +2052,26 @@ static int pr_build_chunk_indx(
         }
     }
 
-    for (i = 0u; i < manifest->sprite_count; ++i) {
-        const pr_manifest_sprite_t *sprite;
-
-        sprite = &manifest->sprites[i];
+    for (i = 0u; i < sprite_count; ++i) {
         if (
-            !pr_byte_buffer_append_u32_le(&buffer, maps->sprite_id_str_idx[i]) ||
-            !pr_byte_buffer_append_u32_le(&buffer, maps->sprite_source_image_idx[i]) ||
-            !pr_byte_buffer_append_u32_le(&buffer, (uint32_t)sprite->mode) ||
-            !pr_byte_buffer_append_u32_le(&buffer, pr_sprite_frame_count_hint(sprite)) ||
-            !pr_byte_buffer_append_u32_le(&buffer, pr_pivot_to_milli(sprite->pivot_x)) ||
-            !pr_byte_buffer_append_u32_le(&buffer, pr_pivot_to_milli(sprite->pivot_y))
+            !pr_byte_buffer_append_u32_le(&buffer, sprites[i].name_str_idx) ||
+            !pr_byte_buffer_append_u32_le(&buffer, (uint32_t)i) ||
+            !pr_byte_buffer_append_u32_le(&buffer, sprites[i].source_image_index) ||
+            !pr_byte_buffer_append_u32_le(&buffer, sprites[i].first_frame) ||
+            !pr_byte_buffer_append_u32_le(&buffer, sprites[i].frame_count)
         ) {
             pr_byte_buffer_free(&buffer);
             return 0;
         }
     }
 
-    for (i = 0u; i < manifest->animation_count; ++i) {
-        const pr_manifest_animation_t *animation;
-
-        animation = &manifest->animations[i];
+    for (i = 0u; i < animation_count; ++i) {
         if (
-            !pr_byte_buffer_append_u32_le(&buffer, maps->animation_id_str_idx[i]) ||
-            !pr_byte_buffer_append_u32_le(&buffer, maps->animation_sprite_idx[i]) ||
-            !pr_byte_buffer_append_u32_le(&buffer, (uint32_t)animation->loop_mode) ||
-            !pr_byte_buffer_append_u32_le(&buffer, (uint32_t)animation->frame_count) ||
-            !pr_byte_buffer_append_u32_le(&buffer, pr_animation_total_duration_ms(animation))
+            !pr_byte_buffer_append_u32_le(&buffer, animations[i].name_str_idx) ||
+            !pr_byte_buffer_append_u32_le(&buffer, (uint32_t)i) ||
+            !pr_byte_buffer_append_u32_le(&buffer, animations[i].sprite_index) ||
+            !pr_byte_buffer_append_u32_le(&buffer, animations[i].key_start) ||
+            !pr_byte_buffer_append_u32_le(&buffer, animations[i].key_count)
         ) {
             pr_byte_buffer_free(&buffer);
             return 0;
@@ -1437,6 +2433,16 @@ pr_status_t pr_build_package(
     pr_imported_image_t *images;
     pr_string_table_t strings;
     pr_index_maps_t maps;
+    pr_resolved_sprite_t *resolved_sprites;
+    size_t resolved_sprite_count;
+    pr_resolved_frame_t *resolved_frames;
+    size_t resolved_frame_count;
+    pr_pack_page_t *atlas_pages;
+    size_t atlas_page_count;
+    pr_resolved_animation_t *resolved_animations;
+    size_t resolved_animation_count;
+    pr_resolved_animation_key_t *resolved_animation_keys;
+    size_t resolved_animation_key_count;
     pr_chunk_payload_t chunks[PR_CHUNK_COUNT_V0];
     pr_status_t status;
     const char *output_path;
@@ -1469,6 +2475,16 @@ pr_status_t pr_build_package(
     images = NULL;
     pr_string_table_init(&strings);
     memset(&maps, 0, sizeof(maps));
+    resolved_sprites = NULL;
+    resolved_sprite_count = 0u;
+    resolved_frames = NULL;
+    resolved_frame_count = 0u;
+    atlas_pages = NULL;
+    atlas_page_count = 0u;
+    resolved_animations = NULL;
+    resolved_animation_count = 0u;
+    resolved_animation_keys = NULL;
+    resolved_animation_key_count = 0u;
     memset(chunks, 0, sizeof(chunks));
 
     status = pr_manifest_load_and_validate(
@@ -1480,7 +2496,7 @@ pr_status_t pr_build_package(
         &validation_warnings
     );
     if (status != PR_STATUS_OK) {
-        return status;
+        goto cleanup;
     }
     (void)validation_errors;
     warning_count = validation_warnings;
@@ -1498,7 +2514,6 @@ pr_status_t pr_build_package(
             output_path
         )
     ) {
-        pr_manifest_free(&manifest);
         pr_emit_diag(
             diag_sink,
             diag_user_data,
@@ -1508,7 +2523,8 @@ pr_status_t pr_build_package(
             "build.output_invalid",
             NULL
         );
-        return PR_STATUS_INVALID_ARGUMENT;
+        status = PR_STATUS_INVALID_ARGUMENT;
+        goto cleanup;
     }
 
     if (!pr_has_prpk_extension(PR_BUILD_RESULT_STORAGE.package_path)) {
@@ -1538,7 +2554,6 @@ pr_status_t pr_build_package(
             debug_output_path
         )
     ) {
-        pr_manifest_free(&manifest);
         pr_emit_diag(
             diag_sink,
             diag_user_data,
@@ -1548,7 +2563,8 @@ pr_status_t pr_build_package(
             "build.debug_output_path_too_long",
             NULL
         );
-        return PR_STATUS_INVALID_ARGUMENT;
+        status = PR_STATUS_INVALID_ARGUMENT;
+        goto cleanup;
     }
 
     status = pr_import_manifest_images(
@@ -1559,13 +2575,10 @@ pr_status_t pr_build_package(
         &images
     );
     if (status != PR_STATUS_OK) {
-        pr_manifest_free(&manifest);
-        return status;
+        goto cleanup;
     }
 
     if (options->strict_mode != 0 && warning_count > 0) {
-        pr_imported_images_free(images, manifest.image_count);
-        pr_manifest_free(&manifest);
         pr_emit_diag(
             diag_sink,
             diag_user_data,
@@ -1575,13 +2588,13 @@ pr_status_t pr_build_package(
             "build.strict_warnings",
             NULL
         );
-        return PR_STATUS_VALIDATION_ERROR;
+        status = PR_STATUS_VALIDATION_ERROR;
+        goto cleanup;
     }
 
     if (!pr_allocate_index_maps(&manifest, &maps)) {
-        pr_imported_images_free(images, manifest.image_count);
-        pr_manifest_free(&manifest);
-        return PR_STATUS_ALLOCATION_FAILED;
+        status = PR_STATUS_ALLOCATION_FAILED;
+        goto cleanup;
     }
 
     if (!pr_build_string_table_and_maps(
@@ -1592,25 +2605,85 @@ pr_status_t pr_build_package(
             diag_sink,
             diag_user_data
         )) {
-        pr_free_index_maps(&maps);
-        pr_string_table_free(&strings);
-        pr_imported_images_free(images, manifest.image_count);
-        pr_manifest_free(&manifest);
-        return PR_STATUS_INTERNAL_ERROR;
+        status = PR_STATUS_INTERNAL_ERROR;
+        goto cleanup;
+    }
+
+    status = pr_resolve_sprite_frames(
+        &manifest,
+        images,
+        &maps,
+        options->manifest_path,
+        diag_sink,
+        diag_user_data,
+        &resolved_sprites,
+        &resolved_sprite_count,
+        &resolved_frames,
+        &resolved_frame_count
+    );
+    if (status != PR_STATUS_OK) {
+        goto cleanup;
+    }
+
+    status = pr_pack_resolved_frames(
+        &manifest,
+        resolved_frames,
+        resolved_frame_count,
+        diag_sink,
+        diag_user_data,
+        &atlas_pages,
+        &atlas_page_count
+    );
+    if (status != PR_STATUS_OK) {
+        goto cleanup;
+    }
+
+    status = pr_resolve_animations(
+        &manifest,
+        &maps,
+        resolved_sprites,
+        resolved_sprite_count,
+        diag_sink,
+        diag_user_data,
+        &resolved_animations,
+        &resolved_animation_count,
+        &resolved_animation_keys,
+        &resolved_animation_key_count
+    );
+    if (status != PR_STATUS_OK) {
+        goto cleanup;
     }
 
     if (
         !pr_build_chunk_strs(&strings, &chunks[0]) ||
-        !pr_build_chunk_indx(&manifest, images, &maps, &chunks[1])
+        !pr_build_chunk_txtr(&manifest, atlas_pages, atlas_page_count, &chunks[1]) ||
+        !pr_build_chunk_sprt(
+            resolved_sprites,
+            resolved_sprite_count,
+            resolved_frames,
+            resolved_frame_count,
+            &chunks[2]
+        ) ||
+        !pr_build_chunk_anim(
+            resolved_animations,
+            resolved_animation_count,
+            resolved_animation_keys,
+            resolved_animation_key_count,
+            &chunks[3]
+        ) ||
+        !pr_build_chunk_indx(
+            &manifest,
+            images,
+            &maps,
+            resolved_sprites,
+            resolved_sprite_count,
+            resolved_animations,
+            resolved_animation_count,
+            &chunks[4]
+        )
     ) {
-        for (i = 0; i < (int)PR_CHUNK_COUNT_V0; ++i) {
-            pr_chunk_payload_free(&chunks[i]);
-        }
-        pr_free_index_maps(&maps);
-        pr_string_table_free(&strings);
-        pr_imported_images_free(images, manifest.image_count);
-        pr_manifest_free(&manifest);
-        return PR_STATUS_ALLOCATION_FAILED;
+        status = PR_STATUS_ALLOCATION_FAILED;
+        goto cleanup;
     }
 
     status = pr_write_package_with_chunks(
@@ -1620,14 +2693,7 @@ pr_status_t pr_build_package(
         diag_sink,
         diag_user_data
     );
-    for (i = 0; i < (int)PR_CHUNK_COUNT_V0; ++i) {
-        pr_chunk_payload_free(&chunks[i]);
-    }
     if (status != PR_STATUS_OK) {
-        pr_free_index_maps(&maps);
-        pr_string_table_free(&strings);
-        pr_imported_images_free(images, manifest.image_count);
-        pr_manifest_free(&manifest);
         pr_emit_diag(
             diag_sink,
             diag_user_data,
@@ -1637,7 +2703,7 @@ pr_status_t pr_build_package(
             "build.output_write_failed",
             NULL
         );
-        return status;
+        goto cleanup;
     }
 
     if (PR_BUILD_RESULT_STORAGE.debug_output_path[0] != '\0') {
@@ -1651,11 +2717,7 @@ pr_status_t pr_build_package(
             diag_user_data
         );
         if (status != PR_STATUS_OK) {
-            pr_free_index_maps(&maps);
-            pr_string_table_free(&strings);
-            pr_imported_images_free(images, manifest.image_count);
-            pr_manifest_free(&manifest);
-            return status;
+            goto cleanup;
         }
     }
 
@@ -1663,7 +2725,7 @@ pr_status_t pr_build_package(
     out_result->debug_output_path = (
         PR_BUILD_RESULT_STORAGE.debug_output_path[0] != '\0'
     ) ? PR_BUILD_RESULT_STORAGE.debug_output_path : NULL;
-    out_result->atlas_page_count = 0u;
+    out_result->atlas_page_count = (unsigned int)atlas_page_count;
     out_result->sprite_count = (unsigned int)manifest.sprite_count;
     out_result->animation_count = (unsigned int)manifest.animation_count;
 
@@ -1671,16 +2733,26 @@ pr_status_t pr_build_package(
         diag_sink,
         diag_user_data,
         PR_DIAG_NOTE,
-        "Wrote .prpk package with STRS and INDX chunks.",
+        "Wrote .prpk package with STRS/TXTR/SPRT/ANIM/INDX chunks.",
         PR_BUILD_RESULT_STORAGE.package_path,
         "build.package_written",
         NULL
     );
 
+    status = PR_STATUS_OK;
+
+cleanup:
+    for (i = 0; i < (int)PR_CHUNK_COUNT_V0; ++i) {
+        pr_chunk_payload_free(&chunks[i]);
+    }
+    free(resolved_animation_keys);
+    free(resolved_animations);
+    free(atlas_pages);
+    free(resolved_frames);
+    free(resolved_sprites);
     pr_free_index_maps(&maps);
     pr_string_table_free(&strings);
     pr_imported_images_free(images, manifest.image_count);
     pr_manifest_free(&manifest);
-    return PR_STATUS_OK;
+    return status;
 }
-
