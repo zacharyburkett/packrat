@@ -3,6 +3,7 @@
 #include <string.h>
 
 #include "packrat/build.h"
+#include "packrat/runtime.h"
 
 typedef struct pr_cli_diag_context {
     int quiet;
@@ -189,27 +190,338 @@ static int pr_cli_run_build(int argc, char **argv)
     return pr_cli_exit_code_for_status(status);
 }
 
+static const char *pr_cli_loop_mode_name(pr_loop_mode_t mode)
+{
+    switch (mode) {
+    case PR_LOOP_ONCE:
+        return "once";
+    case PR_LOOP_LOOP:
+        return "loop";
+    case PR_LOOP_PING_PONG:
+        return "ping_pong";
+    default:
+        return "unknown";
+    }
+}
+
+static void pr_cli_json_escaped(FILE *file, const char *text)
+{
+    const char *cursor;
+
+    if (file == NULL || text == NULL) {
+        return;
+    }
+
+    for (cursor = text; *cursor != '\0'; ++cursor) {
+        switch (*cursor) {
+        case '\\':
+            (void)fputs("\\\\", file);
+            break;
+        case '"':
+            (void)fputs("\\\"", file);
+            break;
+        case '\n':
+            (void)fputs("\\n", file);
+            break;
+        case '\r':
+            (void)fputs("\\r", file);
+            break;
+        case '\t':
+            (void)fputs("\\t", file);
+            break;
+        default:
+            (void)fputc(*cursor, file);
+            break;
+        }
+    }
+}
+
+static unsigned int pr_cli_animation_total_ms(const pr_animation_t *animation)
+{
+    unsigned int total;
+    unsigned int i;
+
+    if (animation == NULL || animation->frames == NULL) {
+        return 0u;
+    }
+
+    total = 0u;
+    for (i = 0u; i < animation->frame_count; ++i) {
+        total += animation->frames[i].duration_ms;
+    }
+    return total;
+}
+
+static void pr_cli_print_inspect_text(
+    const char *package_path,
+    const pr_package_t *package,
+    int verbose
+)
+{
+    unsigned int sprite_count;
+    unsigned int animation_count;
+    unsigned int i;
+
+    sprite_count = pr_package_sprite_count(package);
+    animation_count = pr_package_animation_count(package);
+
+    fprintf(stdout, "Package: %s\n", package_path);
+    fprintf(stdout, "Atlas pages: %u\n", pr_package_atlas_page_count(package));
+    fprintf(stdout, "Sprites: %u\n", sprite_count);
+    fprintf(stdout, "Animations: %u\n", animation_count);
+
+    if (verbose == 0) {
+        return;
+    }
+
+    fprintf(stdout, "\nSprites:\n");
+    for (i = 0u; i < sprite_count; ++i) {
+        const pr_sprite_t *sprite;
+        unsigned int j;
+
+        sprite = pr_package_sprite_at(package, i);
+        if (sprite == NULL) {
+            continue;
+        }
+
+        fprintf(
+            stdout,
+            "  [%u] id=%s frames=%u\n",
+            i,
+            (sprite->id != NULL) ? sprite->id : "<null>",
+            sprite->frame_count
+        );
+
+        for (j = 0u; j < sprite->frame_count; ++j) {
+            const pr_sprite_frame_t *frame;
+
+            frame = &sprite->frames[j];
+            fprintf(
+                stdout,
+                "    frame[%u] page=%u rect=(%u,%u,%u,%u) uv=(%.4f,%.4f)-(%.4f,%.4f)\n",
+                j,
+                frame->atlas_page,
+                frame->x,
+                frame->y,
+                frame->w,
+                frame->h,
+                (double)frame->u0,
+                (double)frame->v0,
+                (double)frame->u1,
+                (double)frame->v1
+            );
+        }
+    }
+
+    fprintf(stdout, "\nAnimations:\n");
+    for (i = 0u; i < animation_count; ++i) {
+        const pr_animation_t *animation;
+        unsigned int j;
+
+        animation = pr_package_animation_at(package, i);
+        if (animation == NULL) {
+            continue;
+        }
+
+        fprintf(
+            stdout,
+            "  [%u] id=%s sprite=%s loop=%s frames=%u total_ms=%u\n",
+            i,
+            (animation->id != NULL) ? animation->id : "<null>",
+            (animation->sprite != NULL && animation->sprite->id != NULL) ?
+                animation->sprite->id : "<null>",
+            pr_cli_loop_mode_name(animation->loop_mode),
+            animation->frame_count,
+            pr_cli_animation_total_ms(animation)
+        );
+
+        for (j = 0u; j < animation->frame_count; ++j) {
+            const pr_anim_frame_t *frame;
+
+            frame = &animation->frames[j];
+            fprintf(
+                stdout,
+                "    key[%u] sprite_frame=%u ms=%u\n",
+                j,
+                frame->sprite_frame_index,
+                frame->duration_ms
+            );
+        }
+    }
+}
+
+static void pr_cli_print_inspect_json(
+    const char *package_path,
+    const pr_package_t *package,
+    int verbose
+)
+{
+    unsigned int sprite_count;
+    unsigned int animation_count;
+    unsigned int i;
+
+    sprite_count = pr_package_sprite_count(package);
+    animation_count = pr_package_animation_count(package);
+
+    (void)fputs("{\"package\":\"", stdout);
+    pr_cli_json_escaped(stdout, package_path);
+    (void)fprintf(
+        stdout,
+        "\",\"atlas_pages\":%u,\"sprite_count\":%u,\"animation_count\":%u",
+        pr_package_atlas_page_count(package),
+        sprite_count,
+        animation_count
+    );
+
+    if (verbose == 0) {
+        (void)fputs("}\n", stdout);
+        return;
+    }
+
+    (void)fputs(",\"sprites\":[", stdout);
+    for (i = 0u; i < sprite_count; ++i) {
+        const pr_sprite_t *sprite;
+        unsigned int j;
+
+        sprite = pr_package_sprite_at(package, i);
+        if (i > 0u) {
+            (void)fputc(',', stdout);
+        }
+
+        (void)fputs("{\"id\":\"", stdout);
+        pr_cli_json_escaped(stdout, (sprite != NULL && sprite->id != NULL) ? sprite->id : "");
+        if (sprite == NULL) {
+            (void)fputs("\",\"frame_count\":0,\"frames\":[]}", stdout);
+            continue;
+        }
+
+        (void)fprintf(stdout, "\",\"frame_count\":%u,\"frames\":[", sprite->frame_count);
+        for (j = 0u; j < sprite->frame_count; ++j) {
+            const pr_sprite_frame_t *frame;
+
+            frame = &sprite->frames[j];
+            if (j > 0u) {
+                (void)fputc(',', stdout);
+            }
+            (void)fprintf(
+                stdout,
+                "{\"index\":%u,\"atlas_page\":%u,\"x\":%u,\"y\":%u,\"w\":%u,\"h\":%u,"
+                "\"u0\":%.6f,\"v0\":%.6f,\"u1\":%.6f,\"v1\":%.6f,"
+                "\"pivot_x\":%.3f,\"pivot_y\":%.3f}",
+                j,
+                frame->atlas_page,
+                frame->x,
+                frame->y,
+                frame->w,
+                frame->h,
+                (double)frame->u0,
+                (double)frame->v0,
+                (double)frame->u1,
+                (double)frame->v1,
+                (double)frame->pivot_x,
+                (double)frame->pivot_y
+            );
+        }
+        (void)fputs("]}", stdout);
+    }
+    (void)fputs("]", stdout);
+
+    (void)fputs(",\"animations\":[", stdout);
+    for (i = 0u; i < animation_count; ++i) {
+        const pr_animation_t *animation;
+        unsigned int j;
+
+        animation = pr_package_animation_at(package, i);
+        if (i > 0u) {
+            (void)fputc(',', stdout);
+        }
+        if (animation == NULL) {
+            (void)fputs(
+                "{\"id\":\"\",\"sprite\":\"\",\"loop\":\"unknown\","
+                "\"frame_count\":0,\"total_ms\":0,\"frames\":[]}",
+                stdout
+            );
+            continue;
+        }
+
+        (void)fputs("{\"id\":\"", stdout);
+        pr_cli_json_escaped(stdout, (animation->id != NULL) ? animation->id : "");
+        (void)fputs("\",\"sprite\":\"", stdout);
+        pr_cli_json_escaped(
+            stdout,
+            (animation->sprite != NULL && animation->sprite->id != NULL) ?
+                animation->sprite->id : ""
+        );
+        (void)fprintf(
+            stdout,
+            "\",\"loop\":\"%s\",\"frame_count\":%u,\"total_ms\":%u,\"frames\":[",
+            pr_cli_loop_mode_name(animation->loop_mode),
+            animation->frame_count,
+            pr_cli_animation_total_ms(animation)
+        );
+
+        for (j = 0u; j < animation->frame_count; ++j) {
+            const pr_anim_frame_t *frame;
+
+            frame = &animation->frames[j];
+            if (j > 0u) {
+                (void)fputc(',', stdout);
+            }
+            (void)fprintf(
+                stdout,
+                "{\"index\":%u,\"sprite_frame\":%u,\"ms\":%u}",
+                j,
+                frame->sprite_frame_index,
+                frame->duration_ms
+            );
+        }
+        (void)fputs("]}", stdout);
+    }
+    (void)fputs("]}\n", stdout);
+}
+
 static int pr_cli_run_inspect(int argc, char **argv)
 {
+    pr_package_t *package;
+    pr_status_t status;
+    int json_output;
+    int verbose;
     int i;
 
     if (argc < 3) {
         return pr_cli_print_usage(stderr);
     }
 
+    package = NULL;
+    json_output = 0;
+    verbose = 0;
+
     for (i = 3; i < argc; ++i) {
-        if (strcmp(argv[i], "--json") == 0 || strcmp(argv[i], "--verbose") == 0) {
+        if (strcmp(argv[i], "--json") == 0) {
+            json_output = 1;
+            continue;
+        }
+        if (strcmp(argv[i], "--verbose") == 0) {
+            verbose = 1;
             continue;
         }
         return pr_cli_print_usage(stderr);
     }
 
-    fprintf(
-        stderr,
-        "Inspect is not implemented yet for package: %s\n",
-        argv[2]
-    );
-    return 4;
+    status = pr_package_open_file(argv[2], &package);
+    if (status != PR_STATUS_OK) {
+        fprintf(stderr, "Inspect failed: %s\n", pr_status_string(status));
+        return pr_cli_exit_code_for_status(status);
+    }
+
+    if (json_output != 0) {
+        pr_cli_print_inspect_json(argv[2], package, verbose);
+    } else {
+        pr_cli_print_inspect_text(argv[2], package, verbose);
+    }
+
+    pr_package_close(package);
+    return 0;
 }
 
 int main(int argc, char **argv)
@@ -234,4 +546,3 @@ int main(int argc, char **argv)
     fprintf(stderr, "Unknown command: %s\n", argv[1]);
     return pr_cli_print_usage(stderr);
 }
-

@@ -229,6 +229,20 @@ const pr_animation_t *pr_package_find_animation(
     const pr_package_t *package,
     const char *animation_id
 );
+
+unsigned int pr_package_atlas_page_count(const pr_package_t *package);
+
+unsigned int pr_package_sprite_count(const pr_package_t *package);
+const pr_sprite_t *pr_package_sprite_at(
+    const pr_package_t *package,
+    unsigned int index
+);
+
+unsigned int pr_package_animation_count(const pr_package_t *package);
+const pr_animation_t *pr_package_animation_at(
+    const pr_package_t *package,
+    unsigned int index
+);
 ```
 
 ## Ownership and Lifetime Rules
@@ -249,4 +263,3 @@ const pr_animation_t *pr_package_find_animation(
 1. `schema_version` in manifest controls parse/validate behavior.
 2. Package header version controls runtime loader compatibility.
 3. Minor format additions must preserve backward compatibility for v0 readers whenever possible.
-

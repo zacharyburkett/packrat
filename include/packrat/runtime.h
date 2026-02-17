@@ -68,9 +68,22 @@ const pr_animation_t *pr_package_find_animation(
     const char *animation_id
 );
 
+unsigned int pr_package_atlas_page_count(const pr_package_t *package);
+
+unsigned int pr_package_sprite_count(const pr_package_t *package);
+const pr_sprite_t *pr_package_sprite_at(
+    const pr_package_t *package,
+    unsigned int index
+);
+
+unsigned int pr_package_animation_count(const pr_package_t *package);
+const pr_animation_t *pr_package_animation_at(
+    const pr_package_t *package,
+    unsigned int index
+);
+
 #ifdef __cplusplus
 }
 #endif
 
 #endif
-
