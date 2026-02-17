@@ -1,38 +1,29 @@
 # Packrat
 
-Packrat is a standalone asset packaging library for games and interactive tools.
+Packrat is a C asset packaging library and CLI focused on data-driven 2D image/sprite/animation content.
 
-Initial focus:
+> Stability notice
+> This repository is pre-1.0 and not stable. Manifest schema, package layout, and API contracts may change between commits.
 
-- Image asset packing
-- Single-image sprites
-- Sprite-sheet frame extraction
-- Data-driven animation clip definitions
+## What Is Implemented
 
-Longer-term direction:
+Library target:
 
-- Expand to additional asset domains (audio, fonts, data blobs, etc.)
-- Remain portable and easy to embed in engine/tool pipelines
+- `packrat::packrat`
 
-## Current Status
+Optional CLI executable:
 
-This repository currently contains initial planning and interface/format documentation.
+- `packrat` (target `packrat_cli`)
 
-It now also includes an initial C/CMake scaffold:
+Current capabilities:
 
-- `packrat::packrat` static library target
-- `packrat` CLI executable
-- Manifest parser + schema validator for the v0 image/sprite/animation schema
-- Image import plumbing for atlas preparation (currently PNG metadata import)
-- Deterministic sprite frame expansion + atlas page packing
-- Package build path that writes `.prpk` with `STRS`/`TXTR`/`SPRT`/`ANIM`/`INDX` chunks
-
-## Documents
-
-- `docs/proposal.md`
-- `docs/architecture.md`
-- `docs/manifest_schema.md`
-- `docs/api.md`
+- Manifest parsing and validation (`schema_version = 1`)
+- PNG decode via `libpng`
+- Sprite frame expansion (`single`, `grid`, `rects`)
+- Atlas page packing
+- `.prpk` package build with `STRS` / `TXTR` / `SPRT` / `ANIM` / `INDX` chunks
+- Runtime package loading APIs for sprites/animations/atlas pixel pages
+- Package inspection in text or JSON output
 
 ## Build
 
@@ -43,16 +34,50 @@ cmake -S . -B build
 cmake --build build
 ```
 
-## CLI (Current)
+## CLI
 
 ```sh
 ./build/packrat validate packrat.toml
 ./build/packrat build packrat.toml
+./build/packrat inspect build/assets/game.prpk --verbose
 ```
 
-Current implementation status:
+Build command options:
 
-- `validate`: parses manifest sections and validates schema/references for v0
-- `build`: validates, imports image metadata, resolves sprite frames, packs atlas pages, and writes `.prpk` with `STRS`/`TXTR`/`SPRT`/`ANIM`/`INDX` chunks (+ optional debug JSON)
-  - `TXTR` currently stores uncompressed RGBA8 atlas page blobs produced via `libpng` decode + frame blits
-- `inspect`: reads `.prpk` metadata and prints package summaries (`--json`, `--verbose`)
+- `--output <path>`
+- `--debug-output <path>`
+- `--pretty-debug-json`
+- `--quiet`
+- `--strict`
+
+Inspect command options:
+
+- `--json`
+- `--verbose`
+
+## CMake Options
+
+- `PACKRAT_BUILD_CLI=ON|OFF`
+
+## Consumer Integration
+
+Current integration model is source inclusion:
+
+```cmake
+add_subdirectory(/absolute/path/to/packrat ${CMAKE_BINARY_DIR}/_deps/packrat EXCLUDE_FROM_ALL)
+target_link_libraries(my_target PRIVATE packrat::packrat)
+```
+
+Note: install/export packaging is not wired yet; use `add_subdirectory(...)` for now.
+
+Public headers:
+
+- `include/packrat/build.h`
+- `include/packrat/runtime.h`
+
+## Docs
+
+- `docs/proposal.md`
+- `docs/architecture.md`
+- `docs/manifest_schema.md`
+- `docs/api.md`
