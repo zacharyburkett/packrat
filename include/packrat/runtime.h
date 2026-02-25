@@ -68,6 +68,23 @@ const pr_animation_t *pr_package_find_animation(
     const char *animation_id
 );
 
+/* Resolve an optional animation id first (if provided), then fall back to a
+ * sprite id. When both are provided and resolve, they must refer to the same
+ * sprite.
+ *
+ * Returns:
+ * - `PR_STATUS_OK` on success (`*out_sprite` is non-NULL)
+ * - `PR_STATUS_VALIDATION_ERROR` when ids are missing/invalid/mismatched
+ * - `PR_STATUS_INVALID_ARGUMENT` for invalid pointers
+ */
+pr_status_t pr_package_resolve_sprite_binding(
+    const pr_package_t *package,
+    const char *sprite_id,
+    const char *animation_id,
+    const pr_sprite_t **out_sprite,
+    const pr_animation_t **out_animation
+);
+
 unsigned int pr_package_atlas_page_count(const pr_package_t *package);
 const unsigned char *pr_package_atlas_page_pixels(
     const pr_package_t *package,

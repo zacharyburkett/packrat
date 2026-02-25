@@ -1145,6 +1145,59 @@ const pr_animation_t *pr_package_find_animation(
     return NULL;
 }
 
+pr_status_t pr_package_resolve_sprite_binding(
+    const pr_package_t *package,
+    const char *sprite_id,
+    const char *animation_id,
+    const pr_sprite_t **out_sprite,
+    const pr_animation_t **out_animation
+)
+{
+    const pr_sprite_t *sprite;
+    const pr_animation_t *animation;
+
+    if (package == NULL || out_sprite == NULL || out_animation == NULL) {
+        return PR_STATUS_INVALID_ARGUMENT;
+    }
+
+    *out_sprite = NULL;
+    *out_animation = NULL;
+
+    sprite = NULL;
+    animation = NULL;
+    if (animation_id != NULL && animation_id[0] != '\0') {
+        animation = pr_package_find_animation(package, animation_id);
+        if (animation == NULL) {
+            return PR_STATUS_VALIDATION_ERROR;
+        }
+        if (animation->sprite == NULL) {
+            return PR_STATUS_VALIDATION_ERROR;
+        }
+        sprite = animation->sprite;
+    }
+
+    if (sprite_id != NULL && sprite_id[0] != '\0') {
+        const pr_sprite_t *explicit_sprite;
+
+        explicit_sprite = pr_package_find_sprite(package, sprite_id);
+        if (explicit_sprite == NULL) {
+            return PR_STATUS_VALIDATION_ERROR;
+        }
+        if (sprite != NULL && sprite != explicit_sprite) {
+            return PR_STATUS_VALIDATION_ERROR;
+        }
+        sprite = explicit_sprite;
+    }
+
+    if (sprite == NULL) {
+        return PR_STATUS_VALIDATION_ERROR;
+    }
+
+    *out_sprite = sprite;
+    *out_animation = animation;
+    return PR_STATUS_OK;
+}
+
 unsigned int pr_package_atlas_page_count(const pr_package_t *package)
 {
     if (package == NULL) {
